@@ -437,6 +437,47 @@ from .query_builder import QueryBuilder
 from .node_factory import NodeFactory
 ```
 
+## Tool Description Updates (LLM guardrails)
+
+The existing tool descriptions don't mention multi-label limitations. An LLM using these
+tools will try `get_related_memories` with a Transaction ID and get empty results with no
+explanation, or `delete_memory` on a Transaction and think it worked. Fix by adding `NOTE:`
+lines to descriptions in `server.py`:
+
+**`delete_memory`** (server.py ~line 338) — current description is one sentence:
+```python
+# BEFORE:
+description="Delete a memory and all its relationships"
+
+# AFTER:
+description="""Delete a memory and all its relationships.
+
+NOTE: Only deletes nodes of type 'memory'. To check if a node is a memory, use get_memory first. Non-memory nodes (e.g., transactions) are not affected by this tool."""
+```
+
+**`get_related_memories`** (server.py ~line 398) — add NOTE at end:
+```python
+# ADD to end of existing description:
+"""
+NOTE: Only returns related nodes of type 'memory'. If the related node is a non-memory type (e.g., transaction), it will not appear in results. Use search_memories with node_type to find non-memory nodes."""
+```
+
+**`recall_memories`** (server.py ~line 82) — add to LESS EFFECTIVE FOR section:
+```python
+# ADD after "- Exact technical terms" line:
+"""- Non-memory node types (transactions, etc.) - use search_memories with node_type instead"""
+```
+
+**`get_recent_activity`** (server.py ~line 438) — add NOTE at end:
+```python
+# ADD to end of existing description:
+"""
+NOTE: Only reports activity for 'memory' type nodes. Non-memory nodes (e.g., transactions) are not included in counts or recent activity lists."""
+```
+
+**`create_relationship`** (server.py ~line 352) — NO change needed. After Phase 5C,
+`create_relationship` works across all node types (label filter removed from existence check).
+
 ## Known Limitations (follow-up)
 
 1. **`recall_memories` not extended:** Fuzzy text search (`recall_memories`) doesn't support
@@ -463,6 +504,7 @@ from .node_factory import NodeFactory
 - [ ] `create_relationship` works between Transaction and Memory (fixed in Phase 5C)
 - [ ] Invalid `node_type` returns clear error message (not a crash)
 - [ ] Handler filters kwargs to target model fields (no Memory fields leaking to Transaction)
+- [ ] Tool descriptions updated with multi-label limitations (delete_memory, get_related_memories, recall_memories, get_recent_activity)
 - [ ] New modules exported from `__init__.py`
 - [ ] All 10 tests pass (6 database integration + 4 MCP handler routing)
 - [ ] `uv run pytest tests/ -v` — zero regressions across entire suite
