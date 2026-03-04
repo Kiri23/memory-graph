@@ -92,6 +92,7 @@ LESS EFFECTIVE FOR:
 - Acronyms (DCAD, JWT, API) - use search_memories with tags instead
 - Proper nouns (company names, services)
 - Exact technical terms
+- Non-memory node types (transactions, etc.) - use search_memories with node_type instead
 
 EXAMPLES:
 - recall_memories(query="timeout fix") - find timeout-related solutions
@@ -189,7 +190,18 @@ Returns memory_id. Use create_relationship to link related memories.""",
                         "context": {
                             "type": "object",
                             "description": "Context information for the memory"
-                        }
+                        },
+                        "node_type": {
+                            "type": "string",
+                            "description": "Node type to store. Default: 'memory'. Other types: 'transaction'.",
+                            "default": "memory"
+                        },
+                        "amount": {"type": "number", "description": "Transaction amount (required for node_type=transaction)"},
+                        "merchant": {"type": "string", "description": "Merchant name (required for node_type=transaction)"},
+                        "category": {"type": "string", "description": "Category (required for node_type=transaction)"},
+                        "payment_method": {"type": "string", "description": "Payment method (optional, default: 'unknown')"},
+                        "currency": {"type": "string", "description": "Currency code (optional, default: 'USD')"},
+                        "date": {"type": "string", "description": "Transaction date in ISO format (required for node_type=transaction)"}
                     },
                     "required": ["type", "title", "content"]
                 }
@@ -303,6 +315,11 @@ For conceptual/natural language queries, use recall_memories instead.""",
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Filter results to only include memories with these relationship types"
+                        },
+                        "node_type": {
+                            "type": "string",
+                            "description": "Filter to a specific node type. Default: 'memory'.",
+                            "default": "memory"
                         }
                     }
                 }
@@ -335,7 +352,9 @@ For conceptual/natural language queries, use recall_memories instead.""",
             ),
             Tool(
                 name="delete_memory",
-                description="Delete a memory and all its relationships",
+                description="""Delete a memory and all its relationships.
+
+NOTE: Only deletes nodes of type 'memory'. To check if a node is a memory, use get_memory first. Non-memory nodes (e.g., transactions) are not affected by this tool.""",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -401,7 +420,9 @@ Filter by relationship_types (e.g., ["SOLVES"], ["CAUSES"]) and max_depth (defau
 
 EXAMPLES:
 - get_related_memories(memory_id="prob-1", relationship_types=["SOLVES"]) - find solutions
-- get_related_memories(memory_id="err-1", relationship_types=["CAUSES"], max_depth=2) - find root causes""",
+- get_related_memories(memory_id="err-1", relationship_types=["CAUSES"], max_depth=2) - find root causes
+
+NOTE: Only returns related nodes of type 'memory'. If the related node is a non-memory type (e.g., transaction), it will not appear in results. Use search_memories with node_type to find non-memory nodes.""",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -442,7 +463,9 @@ Returns: memory counts by type, recent memories (up to 20), unresolved problems.
 
 EXAMPLES:
 - get_recent_activity(days=7) - last week's activity
-- get_recent_activity(days=30, project="/app") - last month for specific project""",
+- get_recent_activity(days=30, project="/app") - last month for specific project
+
+NOTE: Only reports activity for 'memory' type nodes. Non-memory nodes (e.g., transactions) are not included in counts or recent activity lists.""",
                 inputSchema={
                     "type": "object",
                     "properties": {

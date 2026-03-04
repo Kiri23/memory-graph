@@ -15,6 +15,7 @@ from .server import ClaudeMemoryServer
 from .models import (
     Memory,
     MemoryType,
+    Transaction,
     Relationship,
     RelationshipType,
     MemoryNode,
@@ -29,11 +30,21 @@ from .models import (
     BackendError,
     ConfigurationError,
 )
+from .type_registry import NodeTypeRegistry, NodeTypeConfig, get_default_registry, register_custom_types
+from .query_builder import QueryBuilder
+from .node_factory import NodeFactory
 
 __all__ = [
     "ClaudeMemoryServer",
     "Memory",
     "MemoryType",
+    "Transaction",
+    "NodeTypeRegistry",
+    "NodeTypeConfig",
+    "get_default_registry",
+    "register_custom_types",
+    "QueryBuilder",
+    "NodeFactory",
     "Relationship",
     "RelationshipType",
     "MemoryNode",

@@ -7,6 +7,7 @@ This module contains handlers for search operations:
 - contextual_search: Search only within related memories (scoped search)
 """
 
+import json
 import logging
 from typing import Any, Dict, Set, List
 
@@ -46,6 +47,38 @@ async def handle_search_memories(
     Returns:
         CallToolResult with formatted search results or error message
     """
+    node_type = arguments.pop("node_type", "memory")
+
+    if node_type != "memory":
+        try:
+            config = memory_db.registry.get(node_type)
+        except KeyError:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Error: Unknown node type '{node_type}'."
+                )],
+                isError=True
+            )
+
+        meta_keys = {"limit", "offset", "search_tolerance", "match_mode",
+                     "relationship_filter", "include_relationships"}
+        filters = {k: v for k, v in arguments.items() if k not in meta_keys}
+
+        results = await memory_db.search_nodes(node_type, filters)
+
+        if not results:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"No {node_type} nodes found.")]
+            )
+
+        results_text = f"Found {len(results)} {node_type} nodes:\n\n"
+        for i, node in enumerate(results, 1):
+            results_text += f"{i}. {node.model_dump_json()}\n\n"
+
+        return CallToolResult(content=[TextContent(type="text", text=results_text)])
+
+    # --- Existing Memory search path — unchanged below ---
     # Validate input arguments
     validate_search_input(arguments)
 

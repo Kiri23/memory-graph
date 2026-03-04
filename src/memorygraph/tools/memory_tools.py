@@ -8,6 +8,7 @@ This module contains handlers for basic memory operations:
 - delete_memory: Remove a memory and its relationships
 """
 
+import json
 import logging
 from typing import Any, Dict
 
@@ -43,6 +44,34 @@ async def handle_store_memory(
     Returns:
         CallToolResult with memory ID on success or error message on failure
     """
+    # Branch on node_type BEFORE validate_memory_input()
+    node_type = arguments.pop("node_type", "memory")
+
+    if node_type != "memory":
+        try:
+            config = memory_db.registry.get(node_type)
+        except KeyError:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Error: Unknown node type '{node_type}'. "
+                         f"Registered types: {[t.name for t in memory_db.registry.all_types()]}"
+                )],
+                isError=True
+            )
+
+        model = config.model
+        valid_fields = set(model.model_fields.keys())
+        filtered_args = {k: v for k, v in arguments.items() if k in valid_fields}
+
+        node = model(**filtered_args)
+        node_id = await memory_db.store_node(node_type, node)
+        return CallToolResult(content=[TextContent(
+            type="text",
+            text=json.dumps({"memory_id": node_id, "node_type": node_type})
+        )])
+
+    # --- Existing Memory code path — unchanged below this line ---
     # Validate input arguments
     validate_memory_input(arguments)
 
@@ -95,13 +124,23 @@ async def handle_get_memory(
     memory = await memory_db.get_memory(memory_id, include_relationships)
 
     if not memory:
-        return CallToolResult(
-            content=[TextContent(
-                type="text",
-                text=f"Memory not found: {memory_id}"
-            )],
-            isError=True
-        )
+        # Fallback to get_node() for custom node types
+        node = await memory_db.get_node(memory_id)
+        if node is None:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Memory not found: {memory_id}"
+                )],
+                isError=True
+            )
+        return CallToolResult(content=[TextContent(
+            type="text",
+            text=json.dumps({
+                "node_type": type(node).__name__.lower(),
+                "data": json.loads(node.model_dump_json())
+            })
+        )])
 
     # Format memory for display
     memory_text = f"""**Memory: {memory.title}**
