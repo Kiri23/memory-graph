@@ -2,7 +2,7 @@
 
 **Status:** [ ] Not started
 **File:** `src/memorygraph/models.py` (MODIFY)
-**Gate:** `uv run pytest tests/test_transaction_model.py -v` — 6 tests
+**Gate:** `uv run pytest tests/test_transaction_model.py tests/test_type_registry.py tests/test_query_builder.py -v` — 9 new + Phase 1/2 still green
 
 ## What this does
 
@@ -132,6 +132,52 @@ class TestTransactionModel:
         assert t.date.tzinfo == timezone.utc
 ```
 
+## Post-phase: Verify Phase 1 and Phase 2 with real Transaction
+
+Phase 1 and Phase 2 used dummy models because Transaction didn't exist yet. Now
+that it does, verify that `register_custom_types()` wires the real model correctly
+and that earlier tests still pass.
+
+**Step 1 — Run Phase 1 and Phase 2 gates (dummy tests must still pass as-is):**
+```bash
+uv run pytest tests/test_type_registry.py tests/test_query_builder.py -v
+```
+
+**Step 2 — Add integration test to `tests/test_transaction_model.py`:**
+
+```python
+from memorygraph.type_registry import get_default_registry, register_custom_types
+from memorygraph.query_builder import QueryBuilder
+
+class TestTransactionRegistryIntegration:
+    """Verify real Transaction wires into Phase 1 registry and Phase 2 QueryBuilder."""
+
+    def test_register_custom_types_with_real_transaction(self):
+        """register_custom_types() registers the real Transaction model."""
+        registry = get_default_registry()
+        register_custom_types(registry)
+        assert registry.has_type("transaction")
+        assert registry.get_label("transaction") == "Transaction"
+        assert registry.get_model("transaction") == Transaction
+
+    def test_query_builder_with_real_transaction(self):
+        """QueryBuilder generates correct Cypher for the real Transaction type."""
+        registry = get_default_registry()
+        register_custom_types(registry)
+        qb = QueryBuilder(registry)
+        assert qb.match("transaction") == "MATCH (m:Transaction)"
+        assert qb.merge("transaction") == "MERGE (m:Transaction {id: $id})"
+
+    def test_registry_has_both_types(self):
+        """Registry holds Memory + Transaction after register_custom_types()."""
+        registry = get_default_registry()
+        register_custom_types(registry)
+        names = [t.name for t in registry.all_types()]
+        assert "memory" in names
+        assert "transaction" in names
+        assert len(names) == 2
+```
+
 ## Acceptance Criteria
 
 - [ ] Transaction model validates correctly (required fields, defaults)
@@ -140,4 +186,7 @@ class TestTransactionModel:
 - [ ] `to_storage_properties()` returns flat dict suitable for both backends
 - [ ] `context` dict flattens to `context_*` keys in storage properties
 - [ ] Naive datetimes (no timezone) are auto-converted to UTC
-- [ ] All 6 tests pass
+- [ ] `register_custom_types()` registers real Transaction in the registry
+- [ ] QueryBuilder generates correct Cypher for Transaction type
+- [ ] Phase 1 and Phase 2 dummy tests still pass unchanged
+- [ ] All 9 tests pass (6 model + 3 integration)

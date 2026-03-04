@@ -162,6 +162,7 @@ query = f"{self.qb.match(node_type)} WHERE m.id = $id {self.qb.return_with_label
 
 ```python
 import pytest
+from typing import Optional
 from pydantic import BaseModel
 from memorygraph.query_builder import QueryBuilder, _validate_identifier
 from memorygraph.type_registry import NodeTypeRegistry, NodeTypeConfig, get_default_registry
@@ -172,7 +173,7 @@ from memorygraph.type_registry import NodeTypeRegistry, NodeTypeConfig, get_defa
 # It only reads config.label from the registry. Any BaseModel works.
 class DummyTransaction(BaseModel):
     """Stand-in for Transaction. QueryBuilder only needs the label string."""
-    id: str = None
+    id: Optional[str] = None
 
 
 class TestQueryBuilder:
@@ -264,4 +265,4 @@ class TestQueryBuilder:
 - [ ] Queries returning nodes use `return_with_labels()`
 - [ ] `search()` returns parameterized (query, params) tuples
 - [ ] Relationship type interpolation validated (fixes injection at line 830)
-- [ ] All 14 tests pass + existing database tests still pass
+- [ ] All 15 tests pass + existing database tests still pass

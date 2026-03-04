@@ -115,6 +115,7 @@ def register_custom_types(registry: NodeTypeRegistry) -> None:
 
 ```python
 import pytest
+from typing import Optional
 from pydantic import BaseModel
 from memorygraph.type_registry import (
     NodeTypeRegistry, NodeTypeConfig, get_default_registry
@@ -129,7 +130,7 @@ from memorygraph.models import Memory
 class DummyCustomModel(BaseModel):
     """Lightweight stand-in for custom node types. Replace with real
     Transaction import after Phase 3 is implemented."""
-    id: str = None
+    id: Optional[str] = None
     name: str = "test"
 
 

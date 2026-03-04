@@ -48,6 +48,27 @@ class SQLiteFallbackBackend:
 The default `registry=None` + auto-creation preserves backward compatibility — existing
 code that creates backends without a registry argument still works.
 
+**IMPORTANT — Share the same registry instance:** Phase 5 adds `self.registry` to the
+database wrapper classes (`SQLiteMemoryDatabase`, `MemoryDatabase`). Phase 6 adds
+`self.registry` to the backend classes. To avoid two independent registries (where a
+custom type registered on one is invisible to the other), the wrapper should pass its
+registry to the backend:
+
+```python
+# In SQLiteMemoryDatabase.__init__ (Phase 5):
+self.registry = get_default_registry()
+register_custom_types(self.registry)
+self.backend.registry = self.registry  # Share the same instance with backend
+
+# In MemoryDatabase.__init__ (Phase 5):
+self.registry = get_default_registry()
+register_custom_types(self.registry)
+self.connection.registry = self.registry  # Share with backend (if applicable)
+```
+
+Alternatively, pass the registry via constructor when creating the backend. Either way,
+ensure one registry instance is shared — not two independent copies.
+
 ## 6A: Neo4j — Dynamic schema from registry
 
 Currently has 14 hardcoded statements like `CREATE INDEX FOR (m:Memory)`. Replace with registry loop.
@@ -66,12 +87,19 @@ async def _execute_schema_statement(self, statement: str) -> None:
     Helper shared by initialize_schema(). If the backend has an existing
     method for this (e.g., execute_query with write=True), use that instead
     and wrap it with the same error handling.
+
+    IMPORTANT: Only suppresses 'already exists' errors (expected for IF NOT
+    EXISTS on older Neo4j versions). All other errors (network, auth, syntax)
+    are re-raised so callers know schema setup failed.
     """
     try:
         await self.connection.execute_write_query(statement)
     except Exception as e:
-        if "already exists" not in str(e).lower():
-            logger.warning(f"Schema statement failed: {e}")
+        if "already exists" in str(e).lower():
+            logger.debug(f"Schema object already exists (OK): {e}")
+        else:
+            logger.error(f"Schema statement failed: {statement!r} — {e}")
+            raise
 
 async def initialize_schema(self) -> None:
     logger.info("Initializing Neo4j schema from type registry...")
@@ -103,10 +131,14 @@ async def initialize_schema(self) -> None:
                 f'FOR (n:{label}) ON EACH [{fields}]'
             )
 
-    # Relationship indexes (shared)
+    # Relationship indexes (shared, label-agnostic)
     await self._execute_schema_statement(
         "CREATE INDEX IF NOT EXISTS FOR ()-[r:RELATED_TO]-() ON (r.context)"
     )
+    # NOTE: This constraint targets a NODE labeled "RELATIONSHIP", NOT a relationship edge.
+    # The existing codebase stores relationship metadata as separate :RELATIONSHIP nodes
+    # (in addition to the actual graph edges). This constraint is preserved from the
+    # hardcoded schema — do NOT confuse it with a constraint on relationship edges.
     await self._execute_schema_statement(
         "CREATE CONSTRAINT relationship_id_unique IF NOT EXISTS FOR (r:RELATIONSHIP) REQUIRE r.id IS UNIQUE"
     )

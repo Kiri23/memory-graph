@@ -2,7 +2,7 @@
 
 **Status:** [ ] Not started
 **Files:** `src/memorygraph/protocols.py` (MODIFY), `src/memorygraph/database.py` (MODIFY), `src/memorygraph/sqlite_database.py` (MODIFY)
-**Gate:** `uv run pytest tests/test_database_api.py -v` — 9 tests
+**Gate:** `uv run pytest tests/test_database_api.py -v` — 10 tests
 
 ## What this does
 
@@ -63,6 +63,8 @@ class MemoryOperations(Protocol):
             type_name: Registered type name to search within.
             filters: Dict of property_name -> value. Special keys:
                      "query" (text search), "tags" (ANY match), "min_importance".
+                     Pagination: "limit" (default 100), "offset" (default 0).
+                     These are extracted before building WHERE clauses.
 
         Returns:
             List of correctly-typed Pydantic model instances.
@@ -122,22 +124,29 @@ async def store_node(self, type_name: str, node: BaseModel) -> str:
     properties['id'] = node_id
     properties['updated_at'] = now.isoformat()
 
-    properties_json = json.dumps(properties)
-
     # MERGE behavior: update if exists, insert if not
     existing = await asyncio.to_thread(
         self.backend.execute_sync,
-        "SELECT id FROM nodes WHERE id = ? AND label = ?",
+        "SELECT id, properties FROM nodes WHERE id = ? AND label = ?",
         (node_id, label)
     )
 
     if existing:
+        # IMPORTANT: Preserve original created_at from the existing record.
+        # The new Pydantic model has a default created_at of now(), which would
+        # silently overwrite the original creation timestamp.
+        old_props = json.loads(existing[0]['properties'])
+        if 'created_at' in old_props:
+            properties['created_at'] = old_props['created_at']
+
+        properties_json = json.dumps(properties)
         await asyncio.to_thread(
             self.backend.execute_sync,
             "UPDATE nodes SET properties = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND label = ?",
             (properties_json, node_id, label)
         )
     else:
+        properties_json = json.dumps(properties)
         await asyncio.to_thread(
             self.backend.execute_sync,
             "INSERT INTO nodes (id, label, properties, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
@@ -163,12 +172,23 @@ async def get_node(self, node_id: str) -> Optional[BaseModel]:
     return self.factory.from_record(properties, label)
 
 async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
-    """Search nodes of a specific type with property filters."""
+    """Search nodes of a specific type with property filters.
+
+    Supports pagination via 'limit' (default 100) and 'offset' (default 0)
+    keys in the filters dict. These are extracted before building WHERE clauses.
+    """
     config = self.registry.get(type_name)
     label = config.label
 
+    # Extract pagination BEFORE iterating filters (these are not WHERE clauses)
+    limit = int(filters.pop("limit", 100))
+    offset = int(filters.pop("offset", 0))
+
     where_parts = ["label = ?"]
     params = [label]
+
+    # Keys that have special handling — skip in generic property-filter branch
+    _SPECIAL_KEYS = {"query", "tags", "min_importance"}
 
     for key, value in filters.items():
         if key == "query" and value:
@@ -190,6 +210,8 @@ async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
         elif key == "min_importance" and value is not None:
             where_parts.append("CAST(json_extract(properties, '$.importance') AS REAL) >= ?")
             params.append(value)
+        elif key in _SPECIAL_KEYS:
+            continue  # falsy special key — skip silently
         else:
             # Validate field name to prevent JSON path injection
             if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key):
@@ -197,7 +219,10 @@ async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
             where_parts.append(f"json_extract(properties, '$.{key}') = ?")
             params.append(value)
 
-    sql = f"SELECT label, properties FROM nodes WHERE {' AND '.join(where_parts)}"
+    sql = (
+        f"SELECT label, properties FROM nodes WHERE {' AND '.join(where_parts)}"
+        f" ORDER BY updated_at DESC LIMIT {limit} OFFSET {offset}"
+    )
     rows = await asyncio.to_thread(self.backend.execute_sync, sql, tuple(params))
 
     results = []
@@ -254,14 +279,20 @@ async def store_node(self, type_name: str, node: BaseModel) -> str:
     properties['id'] = node_id
     properties['updated_at'] = now.isoformat()
 
+    # IMPORTANT: Remove created_at from the update properties so MERGE ON CREATE
+    # sets it but ON MATCH preserves the original. Neo4j's += would overwrite it
+    # with the new Pydantic model's default (now()) if we leave it in.
+    created_at = properties.pop('created_at', now.isoformat())
+
     query = f"""
     {self.qb.merge(type_name)}
-    SET m += $properties
+    ON CREATE SET m += $properties, m.created_at = $created_at
+    ON MATCH SET m += $properties
     RETURN m.id as id
     """
 
     result = await self.connection.execute_write_query(
-        query, {"id": node_id, "properties": properties}
+        query, {"id": node_id, "properties": properties, "created_at": created_at}
     )
 
     if result:
@@ -293,7 +324,12 @@ async def get_node(self, node_id: str) -> Optional[BaseModel]:
 
 async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
     """Search nodes of a specific type with property filters."""
+    # Extract pagination before passing to QueryBuilder (not Cypher WHERE clauses)
+    limit = int(filters.pop("limit", 100))
+    offset = int(filters.pop("offset", 0))
+
     query, params = self.qb.search(type_name, filters)
+    query += f" ORDER BY m.updated_at DESC SKIP {offset} LIMIT {limit}"
     results = await self.connection.execute_read_query(query, params)
     return [self.factory.from_neo4j_record(r) for r in results]
 ```
@@ -315,6 +351,9 @@ pytestmark = pytest.mark.asyncio  # All tests in this module are async
 class TestDatabaseAPI:
     @pytest_asyncio.fixture
     async def db(self):
+        """NOTE: Both backend.initialize_schema() and db.initialize_schema() are
+        called because the backend creates core tables and the wrapper adds
+        Memory-specific indexes. Both use IF NOT EXISTS so double-init is safe."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = str(Path(tmpdir) / "test.db")
             backend = SQLiteFallbackBackend(db_path=db_path)
@@ -393,6 +432,24 @@ class TestDatabaseAPI:
         result = await db.get_node("fixed-id")
         assert result.amount == 99
 
+    async def test_store_node_preserves_created_at_on_update(self, db):
+        """Updating a node via store_node must NOT overwrite the original created_at."""
+        import time
+        tx = Transaction(id="ts-test", amount=10, merchant="Test", category="test",
+                         date=datetime.now(timezone.utc))
+        await db.store_node("transaction", tx)
+        original = await db.get_node("ts-test")
+        original_created = original.created_at
+
+        time.sleep(0.05)  # ensure clock advances
+
+        tx2 = Transaction(id="ts-test", amount=99, merchant="Updated", category="test",
+                          date=datetime.now(timezone.utc))
+        await db.store_node("transaction", tx2)
+        updated = await db.get_node("ts-test")
+        assert updated.amount == 99
+        assert updated.created_at == original_created  # must be preserved
+
     async def test_transaction_with_only_required_fields(self, db):
         tx = Transaction(amount=5.0, merchant="M", category="c",
                          date=datetime.now(timezone.utc))
@@ -424,6 +481,59 @@ ON CONFLICT(id, label) DO UPDATE SET properties = excluded.properties, updated_a
 
 For now, the SELECT-then-INSERT pattern is correct and sufficient for single-writer SQLite.
 
+## 5C: Fix `create_relationship` for cross-type nodes
+
+Both backends hardcode `label = 'Memory'` in the existence check inside
+`create_relationship`. This is only an existence check (no deserialization), so
+removing the label filter is safe — existing Memory nodes are still found by ID.
+
+**SQLite** (sqlite_database.py:1020-1030) — change:
+```python
+# BEFORE (lines 1023, 1028):
+"SELECT id FROM nodes WHERE id = ? AND label = 'Memory'"
+
+# AFTER:
+"SELECT id FROM nodes WHERE id = ?"
+```
+
+**Neo4j** (database.py:655-660) — change:
+```python
+# BEFORE (lines 656-657):
+query = f"""
+MATCH (from:Memory {{id: $from_id}})
+MATCH (to:Memory {{id: $to_id}})
+CREATE (from)-[r:{relationship_type.value} $properties]->(to)
+RETURN r.id as id
+"""
+
+# AFTER:
+query = f"""
+MATCH (from {{id: $from_id}})
+MATCH (to {{id: $to_id}})
+CREATE (from)-[r:{relationship_type.value} $properties]->(to)
+RETURN r.id as id
+"""
+```
+
+**Why this is safe:**
+- `create_relationship` only checks that the two nodes exist — it does NOT
+  deserialize them into Memory objects. Removing the label filter lets it find
+  Transaction nodes (or any future type) while still finding existing Memory
+  nodes by their UUID.
+- `id` is PRIMARY KEY (SQLite) / has a uniqueness constraint per label (Neo4j),
+  so the lookup is still indexed.
+- Existing Memory↔Memory relationships are unaffected — the nodes still exist
+  and are still found by ID.
+
+**What is NOT changed here:**
+- `delete_memory` — keeps `label = 'Memory'` intentionally. It's `delete_memory`,
+  not `delete_node`. Removing the filter would let it delete Transactions, which
+  breaks the semantic contract.
+- `get_related_memories` — keeps `label = 'Memory'` because it deserializes
+  results as Memory objects (line 1175: `self._properties_to_memory()`). Removing
+  the filter would return Transaction properties to a Memory parser, producing
+  garbage. A future `get_related_nodes` using NodeFactory is needed instead.
+
 ## Known Gaps (deferred to follow-up)
 
 **`delete_node` not included:** This phase adds `store_node`, `get_node`, `search_nodes` but
@@ -435,9 +545,18 @@ This means it will **NOT** delete non-Memory nodes (e.g., Transaction) on the Ne
 The SQLite `delete_memory` (`sqlite_database.py`) also matches `label = 'Memory'` in its
 WHERE clause. **Neither backend deletes custom node types via `delete_memory()`.**
 
-For this release, deleting custom nodes requires direct SQL/Cypher. A typed
-`delete_node(node_id: str) -> bool` that queries by ID without label filtering is needed
-as a follow-up. Until then, document this limitation for users.
+For this release, deleting custom nodes requires direct SQL/Cypher:
+```sql
+-- SQLite workaround:
+DELETE FROM relationships WHERE from_id = '<node_id>' OR to_id = '<node_id>';
+DELETE FROM nodes WHERE id = '<node_id>';
+```
+```cypher
+-- Neo4j workaround:
+MATCH (n {id: $node_id}) DETACH DELETE n
+```
+A typed `delete_node(node_id: str) -> bool` that queries by ID without label filtering is
+needed as a follow-up. Until then, document this limitation for users.
 
 **`update_node` not included:** The existing `update_memory` is Memory-specific (it expects
 Memory fields like `type`, `title`, `content`). For custom types, `store_node` with an
@@ -454,6 +573,6 @@ partial updates should be added in a follow-up.
 - [ ] `search_nodes("transaction", {"category": "dining"})` returns only Transactions
 - [ ] Existing `store_memory` / `get_memory` / `search_memories` unchanged
 - [ ] `store_node` does NOT mutate the input object
-- [ ] Cross-type `create_relationship` works between Transaction and Memory **(SQLite only —
-  Neo4j `create_relationship` still matches `:Memory` label; follow-up needed)**
-- [ ] All 9 tests pass
+- [ ] Cross-type `create_relationship` works between Transaction and Memory (label filter
+  removed from existence checks in both backends — see 5C)
+- [ ] All 10 tests pass
