@@ -296,6 +296,323 @@ MATCH (n)-[:RELATED_TO]->(p:Memory {type: "project"}) RETURN n
 7. QueryBuilder: MATCH (t:Transaction) WHERE t.category = "groceries" AND ...
 ```
 
+## Verification Strategy
+
+### How to run tests
+
+```bash
+cd ~/Code/memory-graph
+
+# Run all tests (SQLite backend, no Neo4j needed)
+uv run pytest tests/ -v
+
+# Run only multi-label tests
+uv run pytest tests/test_registry.py tests/test_query_builder.py tests/test_node_factory.py tests/test_multi_label_integration.py -v
+
+# Run with coverage
+uv run pytest tests/ --cov=memorygraph --cov-report=term-missing
+
+# Run existing tests to verify nothing is broken
+uv run pytest tests/test_database.py tests/test_backward_compatibility.py -v
+```
+
+### Test pattern (matches existing codebase)
+
+Tests use **SQLiteFallbackBackend** with temp directories — no Neo4j instance needed. Follow the pattern in `tests/test_backward_compatibility.py`:
+
+```python
+import pytest
+import tempfile
+from pathlib import Path
+from memorygraph.backends.sqlite_fallback import SQLiteFallbackBackend
+from memorygraph.sqlite_database import SQLiteMemoryDatabase
+
+class TestMyFeature:
+    @pytest.fixture
+    async def db(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "test.db")
+            backend = SQLiteFallbackBackend(db_path=db_path)
+            await backend.connect()
+            await backend.initialize_schema()
+            db = SQLiteMemoryDatabase(backend)
+            await db.initialize_schema()
+            yield db
+            await backend.disconnect()
+```
+
+### Phase 1 verification: `tests/test_registry.py`
+
+```python
+class TestNodeTypeRegistry:
+    def test_register_and_retrieve(self):
+        """Register a type, retrieve it by name."""
+        registry = NodeTypeRegistry()
+        config = NodeTypeConfig(name="transaction", label="Transaction", model=Transaction, indexes=["id"])
+        registry.register(config)
+        assert registry.get_label("transaction") == "Transaction"
+        assert registry.get_model("transaction") == Transaction
+
+    def test_default_memory_type_registered(self):
+        """The 'memory' type should be pre-registered."""
+        registry = get_default_registry()
+        assert registry.get_label("memory") == "Memory"
+        assert registry.get_model("memory") == Memory
+
+    def test_unknown_type_raises(self):
+        """Requesting unknown type raises KeyError with helpful message."""
+        registry = NodeTypeRegistry()
+        with pytest.raises(KeyError, match="unknown_type"):
+            registry.get_label("unknown_type")
+
+    def test_duplicate_registration_raises(self):
+        """Registering same name twice raises ValueError."""
+        registry = NodeTypeRegistry()
+        config = NodeTypeConfig(name="tx", label="Tx", model=Transaction, indexes=[])
+        registry.register(config)
+        with pytest.raises(ValueError, match="already registered"):
+            registry.register(config)
+
+    def test_all_types_returns_all(self):
+        """all_types() returns every registered config."""
+        registry = get_default_registry()  # has "memory"
+        registry.register(NodeTypeConfig(name="transaction", label="Transaction", model=Transaction, indexes=[]))
+        assert len(registry.all_types()) == 2
+        names = [t.name for t in registry.all_types()]
+        assert "memory" in names
+        assert "transaction" in names
+```
+
+**Gate:** All 5 tests pass → Phase 1 is done.
+
+### Phase 2 verification: `tests/test_query_builder.py`
+
+```python
+class TestQueryBuilder:
+    def setup_method(self):
+        self.registry = get_default_registry()
+        self.registry.register(NodeTypeConfig(name="transaction", label="Transaction", model=Transaction, indexes=[]))
+        self.qb = QueryBuilder(self.registry)
+
+    def test_match_memory_unchanged(self):
+        """match('memory') produces same Cypher as before."""
+        assert self.qb.match("memory") == "MATCH (m:Memory)"
+
+    def test_match_transaction(self):
+        """match('transaction') produces Transaction label."""
+        assert self.qb.match("transaction") == "MATCH (m:Transaction)"
+
+    def test_create_memory_unchanged(self):
+        """create('memory') produces same Cypher as before."""
+        assert "CREATE (m:Memory" in self.qb.create("memory")
+
+    def test_create_transaction(self):
+        """create('transaction') produces Transaction label."""
+        assert "CREATE (m:Transaction" in self.qb.create("transaction")
+
+    def test_custom_alias(self):
+        """Can use custom alias."""
+        assert self.qb.match("transaction", alias="t") == "MATCH (t:Transaction)"
+```
+
+**Gate + regression check:**
+```bash
+# Phase 2 tests pass
+uv run pytest tests/test_query_builder.py -v
+
+# AND existing database tests still pass (no query regression)
+uv run pytest tests/test_database.py -v
+```
+
+### Phase 3 verification: `tests/test_transaction_model.py`
+
+```python
+class TestTransactionModel:
+    def test_valid_transaction(self):
+        """Transaction with all required fields validates."""
+        t = Transaction(amount=50.0, merchant="Pueblo", category="groceries", date=datetime.now(timezone.utc))
+        assert t.amount == 50.0
+        assert t.merchant == "Pueblo"
+
+    def test_missing_required_field_raises(self):
+        """Transaction without merchant raises ValidationError."""
+        with pytest.raises(ValidationError):
+            Transaction(amount=50.0, category="groceries", date=datetime.now(timezone.utc))
+
+    def test_default_values(self):
+        """Defaults: currency=USD, payment_method=unknown, importance=0.3."""
+        t = Transaction(amount=10, merchant="Test", category="test", date=datetime.now(timezone.utc))
+        assert t.currency == "USD"
+        assert t.payment_method == "unknown"
+        assert t.importance == 0.3
+
+    def test_tags_lowercased(self):
+        """Tags are normalized to lowercase."""
+        t = Transaction(amount=10, merchant="Test", category="test", date=datetime.now(timezone.utc), tags=["FOOD", "Weekly"])
+        assert t.tags == ["food", "weekly"]
+```
+
+### Phase 4 verification: `tests/test_node_factory.py`
+
+```python
+class TestNodeFactory:
+    def setup_method(self):
+        self.registry = get_default_registry()
+        self.registry.register(NodeTypeConfig(name="transaction", label="Transaction", model=Transaction, indexes=[]))
+        self.factory = NodeFactory(self.registry)
+
+    def test_memory_record_returns_memory(self):
+        """Record with Memory label → Memory object."""
+        record = {"labels": ["Memory"], "id": "1", "type": "task", "title": "Test", "content": "..."}
+        result = self.factory.from_record(record)
+        assert isinstance(result, Memory)
+
+    def test_transaction_record_returns_transaction(self):
+        """Record with Transaction label → Transaction object."""
+        record = {"labels": ["Transaction"], "id": "2", "amount": 50.0, "merchant": "Pueblo", "category": "groceries", "date": "2026-03-03T00:00:00Z"}
+        result = self.factory.from_record(record)
+        assert isinstance(result, Transaction)
+        assert result.amount == 50.0
+
+    def test_unknown_label_falls_back_to_memory(self):
+        """Record with unknown label → Memory fallback."""
+        record = {"labels": ["WeirdType"], "id": "3", "type": "general", "title": "X", "content": "Y"}
+        result = self.factory.from_record(record)
+        assert isinstance(result, Memory)
+```
+
+### Phase 5 verification: `tests/test_schema_manager.py`
+
+```python
+class TestSchemaManager:
+    @pytest.fixture
+    async def db(self):
+        """SQLite backend with registry."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "test.db")
+            backend = SQLiteFallbackBackend(db_path=db_path)
+            await backend.connect()
+            # Schema should be created by registry types
+            await backend.initialize_schema()
+            db = SQLiteMemoryDatabase(backend)
+            await db.initialize_schema()
+            yield db
+            await backend.disconnect()
+
+    async def test_memory_schema_exists(self, db):
+        """Memory table/indexes exist after init."""
+        # Verify by storing and retrieving a Memory
+        memory = Memory(type=MemoryType.TASK, title="Test", content="Content")
+        mid = await db.store_memory(memory)
+        result = await db.get_memory(mid)
+        assert result.title == "Test"
+
+    async def test_schema_idempotent(self, db):
+        """Calling initialize_schema twice doesn't error."""
+        await db.initialize_schema()  # second call
+        memory = Memory(type=MemoryType.TASK, title="Test2", content="Content2")
+        mid = await db.store_memory(memory)
+        assert mid is not None
+```
+
+### Phase 6 verification: `tests/test_multi_label_integration.py`
+
+The end-to-end test that proves the full chain works:
+
+```python
+class TestMultiLabelIntegration:
+    """Full chain: MCP tool call → database → store → retrieve → correct type."""
+
+    @pytest.fixture
+    async def db(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "integration.db")
+            backend = SQLiteFallbackBackend(db_path=db_path)
+            await backend.connect()
+            await backend.initialize_schema()
+            db = SQLiteMemoryDatabase(backend)
+            await db.initialize_schema()
+            yield db
+            await backend.disconnect()
+
+    async def test_store_and_retrieve_transaction(self, db):
+        """Store a Transaction, retrieve it, verify type and properties."""
+        # This is the ultimate proof: if this passes, multi-label works end-to-end
+        tx = Transaction(amount=42.50, merchant="Pueblo Supermarket", category="groceries",
+                         payment_method="google_pay", date=datetime.now(timezone.utc))
+        tx_id = await db.store_node("transaction", tx)
+        retrieved = await db.get_node(tx_id)
+        assert isinstance(retrieved, Transaction)
+        assert retrieved.amount == 42.50
+        assert retrieved.merchant == "Pueblo Supermarket"
+        assert retrieved.payment_method == "google_pay"
+
+    async def test_store_memory_still_works(self, db):
+        """Existing store_memory unchanged — backward compatible."""
+        memory = Memory(type=MemoryType.SOLUTION, title="Redis fix", content="Increased timeout")
+        mid = await db.store_memory(memory)
+        result = await db.get_memory(mid)
+        assert isinstance(result, Memory)
+        assert result.title == "Redis fix"
+
+    async def test_cross_type_relationship(self, db):
+        """Can create relationship between Transaction and Memory."""
+        tx = Transaction(amount=100, merchant="AWS", category="infrastructure",
+                         date=datetime.now(timezone.utc))
+        tx_id = await db.store_node("transaction", tx)
+
+        memory = Memory(type=MemoryType.PROJECT, title="KiriInfra", content="VPS infrastructure")
+        mem_id = await db.store_memory(memory)
+
+        rel_id = await db.create_relationship(tx_id, mem_id, "RELATED_TO", context="AWS bill for KiriInfra")
+        assert rel_id is not None
+
+        related = await db.get_related_memories(mem_id)
+        assert len(related) >= 1
+
+    async def test_search_transactions_only(self, db):
+        """Search scoped to transaction type doesn't return memories."""
+        tx = Transaction(amount=25, merchant="Cafe", category="dining", date=datetime.now(timezone.utc))
+        await db.store_node("transaction", tx)
+        memory = Memory(type=MemoryType.TASK, title="Cafe review", content="Write review")
+        await db.store_memory(memory)
+
+        results = await db.search_nodes("transaction", {"category": "dining"})
+        assert len(results) >= 1
+        assert all(isinstance(r, Transaction) for r in results)
+
+    async def test_existing_test_suite_passes(self):
+        """Meta-test: run existing backward compatibility tests."""
+        # This is verified by running:
+        # uv run pytest tests/test_backward_compatibility.py tests/test_database.py -v
+        # If those pass alongside our new tests, backward compat is proven.
+        pass
+```
+
+### Verification gate per phase
+
+| Phase | Gate command | Must pass |
+|-------|-------------|-----------|
+| 1 | `uv run pytest tests/test_registry.py -v` | 5 tests |
+| 2 | `uv run pytest tests/test_query_builder.py tests/test_database.py -v` | QB tests + existing DB tests |
+| 3 | `uv run pytest tests/test_transaction_model.py -v` | 4 tests |
+| 4 | `uv run pytest tests/test_node_factory.py -v` | 3 tests |
+| 5 | `uv run pytest tests/test_schema_manager.py tests/test_backward_compatibility.py -v` | Schema + backward compat |
+| 6 | `uv run pytest tests/test_multi_label_integration.py -v` | 5 integration tests |
+| **ALL** | `uv run pytest tests/ -v` | **Every test in the repo passes** |
+
+### Autonomous workflow rule
+
+**Do NOT proceed to Phase N+1 until Phase N's gate passes.** If a test fails:
+1. Read the error message
+2. Fix the code
+3. Re-run the gate command
+4. Only move on when green
+
+After ALL phases: run `uv run pytest tests/ -v` to verify zero regressions across the entire test suite.
+
+---
+
 ## Open Questions
 
 1. **Option A vs B for MCP tools?** — Separate tools (store_transaction) vs extended existing tools (store_memory with node_type param)?
