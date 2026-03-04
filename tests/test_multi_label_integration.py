@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from memorygraph.backends.sqlite_fallback import SQLiteFallbackBackend
 from memorygraph.sqlite_database import SQLiteMemoryDatabase
-from memorygraph.models import Memory, MemoryType, Transaction
+from memorygraph.models import Memory, MemoryType, Transaction, RelationshipType
 
 pytestmark = pytest.mark.asyncio
 
@@ -52,7 +52,7 @@ class TestMultiLabelIntegration:
         memory = Memory(type=MemoryType.PROJECT, title="KiriInfra", content="VPS infrastructure")
         mem_id = await db.store_memory(memory)
 
-        rel_id = await db.create_relationship(tx_id, mem_id, "RELATED_TO", context="AWS bill for KiriInfra")
+        rel_id = await db.create_relationship(tx_id, mem_id, RelationshipType.RELATED_TO, context="AWS bill for KiriInfra")
         assert rel_id is not None
 
     async def test_search_transactions_only(self, db):

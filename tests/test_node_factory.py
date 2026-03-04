@@ -11,7 +11,9 @@ class TestNodeFactory:
         self.factory = NodeFactory(self.registry)
 
     def test_memory_from_record(self):
-        props = {"id": "1", "type": "task", "title": "Test", "content": "..."}
+        props = {"id": "1", "type": "task", "title": "Test", "content": "Some content here",
+                 "tags": [], "importance": 0.5, "confidence": 0.8, "usage_count": 0,
+                 "created_at": "2026-03-03T00:00:00+00:00", "updated_at": "2026-03-03T00:00:00+00:00"}
         result = self.factory.from_record(props, "Memory")
         assert isinstance(result, Memory)
 
@@ -23,7 +25,9 @@ class TestNodeFactory:
         assert result.amount == 50.0
 
     def test_unknown_label_falls_back_to_memory(self):
-        props = {"id": "3", "type": "general", "title": "X", "content": "Y"}
+        props = {"id": "3", "type": "general", "title": "X", "content": "Some content",
+                 "tags": [], "importance": 0.5, "confidence": 0.8, "usage_count": 0,
+                 "created_at": "2026-03-03T00:00:00+00:00", "updated_at": "2026-03-03T00:00:00+00:00"}
         result = self.factory.from_record(props, "WeirdType")
         assert isinstance(result, Memory)
 
@@ -46,7 +50,9 @@ class TestNodeFactory:
         assert isinstance(result, Transaction)
 
     def test_context_prefix_normalization(self):
-        props = {"id": "6", "type": "task", "title": "Test", "content": "...",
+        props = {"id": "6", "type": "task", "title": "Test", "content": "Some content",
+                 "tags": [], "importance": 0.5, "confidence": 0.8, "usage_count": 0,
+                 "created_at": "2026-03-03T00:00:00+00:00", "updated_at": "2026-03-03T00:00:00+00:00",
                  "context_project_path": "/my/project", "context_session_id": "abc"}
         result = self.factory.from_record(props, "Memory")
         assert isinstance(result, Memory)
