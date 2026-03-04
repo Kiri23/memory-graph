@@ -44,8 +44,13 @@ class NodeFactory:
         """Deserialize a storage record to the correct Python model.
 
         Unified entry point for BOTH backends:
-          Neo4j:  factory.from_record(record["m"], record["labels"][0])
+          Neo4j:  factory.from_neo4j_record(record)  # preferred — uses _pick_specific_label()
+                  factory.from_record(record["m"], label)  # if label already resolved
           SQLite: factory.from_record(json.loads(row["properties"]), row["label"])
+
+        WARNING: Do NOT use record["labels"][0] directly — it may pick "Memory"
+        instead of the specific type if Memory comes first in the list. Use
+        from_neo4j_record() for Neo4j paths, which handles multi-label resolution.
         """
         config = self._resolve_type(label)
 

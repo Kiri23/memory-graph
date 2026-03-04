@@ -54,7 +54,7 @@ Phase 7: MCP Tools (needs 5)
 | Phase | File | Gate | Tests |
 |-------|------|------|-------|
 | 1 | [phase-1-registry.md](phase-1-registry.md) | `uv run pytest tests/test_type_registry.py -v` | 7 |
-| 2 | [phase-2-query-builder.md](phase-2-query-builder.md) | `uv run pytest tests/test_query_builder.py tests/test_database.py -v` | 14 + existing |
+| 2 | [phase-2-query-builder.md](phase-2-query-builder.md) | `uv run pytest tests/test_query_builder.py tests/test_database.py -v` | 15 + existing |
 | 3 | [phase-3-transaction.md](phase-3-transaction.md) | `uv run pytest tests/test_transaction_model.py -v` | 6 |
 | 4 | [phase-4-node-factory.md](phase-4-node-factory.md) | `uv run pytest tests/test_node_factory.py -v` | 7 |
 | 5 | [phase-5-database-api.md](phase-5-database-api.md) | `uv run pytest tests/test_database_api.py -v` | 9 |
@@ -104,7 +104,12 @@ After ALL phases: `uv run pytest tests/ -v` — zero regressions.
 1. `MemoryNode` (models.py:394) has `labels: List[str]` — defined but never used
 2. SQLite `nodes` table already has `label TEXT` column (sqlite_fallback.py:159)
 3. `database.py:210` and `neo4j_backend.py:116` call `result.data()` → plain dicts, not neo4j.graph.Node
-4. Relationships table uses IDs only — cross-type relationships work automatically
+4. **SQLite** relationships table uses IDs only — cross-type relationships work automatically
+5. **Neo4j** `create_relationship` and `delete_memory` match `:Memory` label — they will
+   **NOT work** for non-Memory nodes. `create_relationship` (database.py:655) uses
+   `MATCH (from:Memory {id: $from_id}) MATCH (to:Memory {id: $to_id})`. This is a known
+   limitation for this release — Phase 5 integration tests use SQLite only. A follow-up
+   must update Neo4j relationship/delete queries to be label-agnostic (match by ID only).
 
 ## Implementation Notes
 

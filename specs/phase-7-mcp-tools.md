@@ -41,33 +41,60 @@ Extends existing MCP tools with an optional `node_type` parameter. When omitted,
 
 ## Handler logic
 
+**Required new imports** (add to top of `tools/memory_tools.py`):
 ```python
-# In tools/memory_tools.py
+import json  # needed for custom node type JSON responses
+```
 
-async def handle_store_memory(context, kwargs):
-    node_type = kwargs.pop("node_type", "memory")
+```python
+# In tools/memory_tools.py — modified handle_store_memory
+#
+# IMPORTANT: The existing function signature is:
+#   handle_store_memory(memory_db: MemoryDatabase, arguments: Dict[str, Any]) -> CallToolResult
+# Do NOT change it. The first arg is the database directly, NOT a context wrapper.
 
-    if node_type == "memory":
-        # Existing code path — unchanged
-        memory = Memory(type=kwargs.get("type"), title=kwargs["title"], ...)
-        memory_id = await context.db.store_memory(memory)
-        ...
-    else:
-        # Custom node type path
-        config = context.db.registry.get(node_type)  # raises KeyError if invalid
+@handle_tool_errors("store memory")
+async def handle_store_memory(
+    memory_db: MemoryDatabase,
+    arguments: Dict[str, Any]
+) -> CallToolResult:
+    # --- NEW: Branch on node_type BEFORE validate_memory_input() ---
+    # validate_memory_input() expects Memory fields (type, title, content).
+    # Custom node types won't have those, so we must branch first.
+    node_type = arguments.pop("node_type", "memory")
+
+    if node_type != "memory":
+        # Custom node type path — skip Memory-specific validation
+        try:
+            config = memory_db.registry.get(node_type)  # raises KeyError if invalid
+        except KeyError:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Error: Unknown node type '{node_type}'. "
+                         f"Registered types: {[t.name for t in memory_db.registry.all_types()]}"
+                )],
+                isError=True
+            )
+
         model = config.model
 
-        # IMPORTANT: Filter kwargs to only fields the target model accepts.
+        # IMPORTANT: Filter arguments to only fields the target model accepts.
         # Without this, Memory-specific fields (type, title, content) that the
         # LLM sends alongside node_type would cause Pydantic ValidationError.
         valid_fields = set(model.model_fields.keys())
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+        filtered_args = {k: v for k, v in arguments.items() if k in valid_fields}
 
-        node = model(**filtered_kwargs)  # Pydantic validates required fields
-        node_id = await context.db.store_node(node_type, node)
+        node = model(**filtered_args)  # Pydantic validates required fields
+        node_id = await memory_db.store_node(node_type, node)
         return CallToolResult(content=[TextContent(
+            type="text",
             text=json.dumps({"memory_id": node_id, "node_type": node_type})
         )])
+
+    # --- Existing Memory code path — unchanged below this line ---
+    validate_memory_input(arguments)
+    # ... rest of existing handler ...
 ```
 
 ## Extending `search_memories`
@@ -88,7 +115,59 @@ async def handle_store_memory(context, kwargs):
 }
 ```
 
-Handler routes to `search_nodes(type_name, filters)` when `node_type != "memory"`.
+**Handler code** (modify `tools/search_tools.py`):
+
+```python
+# In tools/search_tools.py — modified handle_search_memories
+#
+# IMPORTANT: The existing function signature is:
+#   handle_search_memories(memory_db: MemoryDatabase, arguments: Dict[str, Any]) -> CallToolResult
+# Do NOT change it. The first arg is the database directly, NOT a context wrapper.
+
+import json  # add to imports
+
+@handle_tool_errors("search memories")
+async def handle_search_memories(
+    memory_db: MemoryDatabase,
+    arguments: Dict[str, Any]
+) -> CallToolResult:
+    node_type = arguments.pop("node_type", "memory")
+
+    if node_type != "memory":
+        # Custom node type path — use search_nodes() directly
+        try:
+            config = memory_db.registry.get(node_type)
+        except KeyError:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Error: Unknown node type '{node_type}'."
+                )],
+                isError=True
+            )
+
+        # Build filters from remaining arguments (exclude pagination/search meta)
+        meta_keys = {"limit", "offset", "search_tolerance", "match_mode",
+                     "relationship_filter", "include_relationships"}
+        filters = {k: v for k, v in arguments.items() if k not in meta_keys}
+
+        results = await memory_db.search_nodes(node_type, filters)
+
+        if not results:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"No {node_type} nodes found.")]
+            )
+
+        results_text = f"Found {len(results)} {node_type} nodes:\n\n"
+        for i, node in enumerate(results, 1):
+            results_text += f"{i}. {node.model_dump_json()}\n\n"
+
+        return CallToolResult(content=[TextContent(type="text", text=results_text)])
+
+    # --- Existing Memory search path — unchanged below ---
+    validate_search_input(arguments)
+    # ... rest of existing handler ...
+```
 
 ## Example flow
 
@@ -205,12 +284,15 @@ class TestMCPHandlerRouting:
     """MCP tool handler tests — verifies the node_type routing logic.
 
     These test the actual handler function, not just the database.
-    Uses a minimal mock context to simulate what server.py passes.
+
+    IMPORTANT: The handler signature is:
+        handle_store_memory(memory_db: MemoryDatabase, arguments: Dict[str, Any])
+    The first arg is the database DIRECTLY — not a context wrapper.
     """
 
     @pytest_asyncio.fixture
-    async def context(self):
-        """Create a minimal context with a real database for handler testing."""
+    async def db(self):
+        """Create a real database for handler testing."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = str(Path(tmpdir) / "handler_test.db")
             backend = SQLiteFallbackBackend(db_path=db_path)
@@ -218,48 +300,52 @@ class TestMCPHandlerRouting:
             await backend.initialize_schema()
             db = SQLiteMemoryDatabase(backend)
             await db.initialize_schema()
-
-            class MockContext:
-                pass
-            ctx = MockContext()
-            ctx.db = db
-            yield ctx
+            yield db
             await backend.disconnect()
 
-    async def test_handler_routes_transaction_via_node_type(self, context):
+    async def test_handler_routes_transaction_via_node_type(self, db):
         """store_memory with node_type='transaction' stores a Transaction, not Memory."""
         from memorygraph.tools.memory_tools import handle_store_memory
-        result = await handle_store_memory(context, {
+        result = await handle_store_memory(db, {
             "node_type": "transaction",
             "amount": 50.0,
             "merchant": "Pueblo",
             "category": "groceries",
             "date": datetime.now(timezone.utc).isoformat(),
         })
-        # Result should contain the node_id and node_type
+        # Result should contain JSON with node_id and node_type
         result_data = json.loads(result.content[0].text)
         assert result_data["node_type"] == "transaction"
         # Verify it's actually stored as a Transaction
-        retrieved = await context.db.get_node(result_data["memory_id"])
+        retrieved = await db.get_node(result_data["memory_id"])
         assert isinstance(retrieved, Transaction)
 
-    async def test_handler_default_memory_path_unchanged(self, context):
-        """store_memory WITHOUT node_type still stores a Memory (backward compat)."""
+    async def test_handler_default_memory_path_unchanged(self, db):
+        """store_memory WITHOUT node_type still stores a Memory (backward compat).
+
+        NOTE: The existing Memory handler returns a plain string like
+        "Memory stored successfully with ID: <uuid>", NOT JSON.
+        We parse the ID from that string — do NOT json.loads() it.
+        """
         from memorygraph.tools.memory_tools import handle_store_memory
-        result = await handle_store_memory(context, {
+        result = await handle_store_memory(db, {
             "type": "task",
             "title": "Test task",
             "content": "Some content",
         })
-        result_data = json.loads(result.content[0].text)
-        retrieved = await context.db.get_memory(result_data["memory_id"])
+        # Existing handler returns: "Memory stored successfully with ID: <uuid>"
+        result_text = result.content[0].text
+        assert "Memory stored successfully" in result_text
+        # Extract the UUID from the plain-text response
+        memory_id = result_text.split("ID: ")[1].strip()
+        retrieved = await db.get_memory(memory_id)
         assert isinstance(retrieved, Memory)
         assert retrieved.title == "Test task"
 
-    async def test_handler_invalid_node_type_returns_error(self, context):
+    async def test_handler_invalid_node_type_returns_error(self, db):
         """store_memory with unknown node_type returns a clear error, not a crash."""
         from memorygraph.tools.memory_tools import handle_store_memory
-        result = await handle_store_memory(context, {
+        result = await handle_store_memory(db, {
             "node_type": "nonexistent_type",
             "data": "whatever",
         })

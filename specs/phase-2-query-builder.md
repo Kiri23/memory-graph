@@ -2,7 +2,7 @@
 
 **Status:** [ ] Not started
 **Files:** `src/memorygraph/query_builder.py` (NEW), `src/memorygraph/database.py` (MODIFY)
-**Gate:** `uv run pytest tests/test_query_builder.py tests/test_database.py -v` — 14 QB tests + existing DB tests
+**Gate:** `uv run pytest tests/test_query_builder.py tests/test_database.py -v` — 15 QB tests + existing DB tests
 
 ## What this does
 
@@ -104,6 +104,12 @@ class QueryBuilder:
         conditions = []
         params = {}
 
+        # Known special keys that have custom handling — skip them in the
+        # generic property-filter else branch even if their value is falsy
+        # (e.g., query="", tags=[]). Without this guard, falsy special keys
+        # fall through to else and generate invalid Cypher like m.query = "".
+        _SPECIAL_KEYS = {"query", "tags", "min_importance"}
+
         for key, value in filters.items():
             if key == "query" and value:
                 conditions.append(
@@ -118,6 +124,10 @@ class QueryBuilder:
             elif key == "min_importance" and value is not None:
                 conditions.append("m.importance >= $min_importance")
                 params["min_importance"] = value
+            elif key in _SPECIAL_KEYS:
+                # Special key with falsy value (query="", tags=[], min_importance=None)
+                # — skip silently instead of treating as a property filter
+                continue
             else:
                 safe_key = _validate_identifier(key, "filter_field")
                 param_name = f"filter_{safe_key}"
@@ -229,6 +239,15 @@ class TestQueryBuilder:
         """merge() always uses id as the key — no key_field parameter."""
         assert self.qb.merge("memory") == "MERGE (m:Memory {id: $id})"
         assert self.qb.merge("transaction") == "MERGE (m:Transaction {id: $id})"
+
+    def test_search_ignores_falsy_special_keys(self):
+        """Empty query/tags should be silently skipped, not treated as property filters."""
+        query, params = self.qb.search("memory", {"query": "", "tags": [], "category": "test"})
+        # Should NOT contain m.query or m.tags as property filters
+        assert "m.query" not in query
+        assert "m.tags =" not in query
+        # Should still have the real property filter
+        assert "filter_category" in params
 
     def test_invalid_relationship_type_rejected(self):
         with pytest.raises(ValueError, match="Invalid"):

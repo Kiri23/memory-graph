@@ -60,6 +60,19 @@ from ..query_builder import _validate_identifier
 ```python
 # In neo4j_backend.py
 
+async def _execute_schema_statement(self, statement: str) -> None:
+    """Execute a single DDL statement, ignoring 'already exists' errors.
+
+    Helper shared by initialize_schema(). If the backend has an existing
+    method for this (e.g., execute_query with write=True), use that instead
+    and wrap it with the same error handling.
+    """
+    try:
+        await self.connection.execute_write_query(statement)
+    except Exception as e:
+        if "already exists" not in str(e).lower():
+            logger.warning(f"Schema statement failed: {e}")
+
 async def initialize_schema(self) -> None:
     logger.info("Initializing Neo4j schema from type registry...")
 
@@ -105,6 +118,11 @@ async def initialize_schema(self) -> None:
 
 SQLite already handles any label. Just add performance indexes.
 
+**Required import** (add to top of `sqlite_fallback.py`):
+```python
+from ..query_builder import _validate_identifier
+```
+
 ```python
 # In sqlite_fallback.py
 
@@ -112,7 +130,11 @@ async def initialize_schema(self) -> None:
     # ... existing table creation stays the same ...
 
     for type_config in self.registry.all_types():
-        label = type_config.label  # Safe: from Python code, not user input
+        # IMPORTANT: Validate label before using in DDL string interpolation.
+        # SQLite DDL (CREATE INDEX) does NOT support parameterized WHERE clauses,
+        # so string interpolation is required. Validation prevents injection if
+        # custom types are ever registered from user input in the future.
+        label = _validate_identifier(type_config.label, "label")
 
         # Label-specific index for filtered queries
         try:
@@ -125,6 +147,7 @@ async def initialize_schema(self) -> None:
 
         # Property-specific JSON indexes
         for field_name in type_config.indexes:
+            field_name = _validate_identifier(field_name, "index_field")
             try:
                 cursor.execute(
                     f"CREATE INDEX IF NOT EXISTS idx_{label.lower()}_{field_name} "

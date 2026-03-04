@@ -83,10 +83,15 @@ from .node_factory import NodeFactory
 ```
 
 ```python
-# Added to SQLiteMemoryDatabase
+# MODIFY SQLiteMemoryDatabase.__init__ — add registry + factory after existing self.backend line.
+# The existing __init__ is:
+#     def __init__(self, backend: SQLiteFallbackBackend):
+#         self.backend = backend
+# Add the new lines below it:
 
 def __init__(self, backend: SQLiteFallbackBackend):
-    self.backend = backend
+    self.backend = backend  # existing
+    # --- NEW: wire registry and factory ---
     self.registry = get_default_registry()
     register_custom_types(self.registry)  # Wire Transaction + future custom types
     self.factory = NodeFactory(self.registry)
@@ -214,10 +219,15 @@ from .query_builder import QueryBuilder, _validate_identifier
 ```
 
 ```python
-# Added to MemoryDatabase
+# MODIFY MemoryDatabase.__init__ — add registry, factory, qb after existing self.connection line.
+# The existing __init__ is:
+#     def __init__(self, connection):
+#         self.connection = connection
+# Add the new lines below it:
 
 def __init__(self, connection):
-    self.connection = connection
+    self.connection = connection  # existing
+    # --- NEW: wire registry, factory, and query builder ---
     self.registry = get_default_registry()
     register_custom_types(self.registry)  # Wire Transaction + future custom types
     self.factory = NodeFactory(self.registry)
@@ -417,10 +427,17 @@ For now, the SELECT-then-INSERT pattern is correct and sufficient for single-wri
 ## Known Gaps (deferred to follow-up)
 
 **`delete_node` not included:** This phase adds `store_node`, `get_node`, `search_nodes` but
-not `delete_node`. The existing `delete_memory` works by matching on node ID only (not label),
-so it will delete any node type. For this release, use `delete_memory(id)` to delete custom
-nodes. A typed `delete_node(node_id: str) -> bool` should be added in a follow-up if
-label-specific deletion behavior is needed.
+not `delete_node`.
+
+**WARNING — Neo4j `delete_memory` matches `:Memory` label only:**
+The existing `delete_memory` in `database.py:604` uses `MATCH (m:Memory {id: $memory_id})`.
+This means it will **NOT** delete non-Memory nodes (e.g., Transaction) on the Neo4j backend.
+The SQLite `delete_memory` (`sqlite_database.py`) also matches `label = 'Memory'` in its
+WHERE clause. **Neither backend deletes custom node types via `delete_memory()`.**
+
+For this release, deleting custom nodes requires direct SQL/Cypher. A typed
+`delete_node(node_id: str) -> bool` that queries by ID without label filtering is needed
+as a follow-up. Until then, document this limitation for users.
 
 **`update_node` not included:** The existing `update_memory` is Memory-specific (it expects
 Memory fields like `type`, `title`, `content`). For custom types, `store_node` with an
@@ -437,5 +454,6 @@ partial updates should be added in a follow-up.
 - [ ] `search_nodes("transaction", {"category": "dining"})` returns only Transactions
 - [ ] Existing `store_memory` / `get_memory` / `search_memories` unchanged
 - [ ] `store_node` does NOT mutate the input object
-- [ ] Cross-type `create_relationship` works between Transaction and Memory
+- [ ] Cross-type `create_relationship` works between Transaction and Memory **(SQLite only —
+  Neo4j `create_relationship` still matches `:Memory` label; follow-up needed)**
 - [ ] All 9 tests pass
