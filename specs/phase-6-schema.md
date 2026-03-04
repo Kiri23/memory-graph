@@ -11,10 +11,51 @@ Replaces 14 hardcoded `:Memory` schema statements in neo4j_backend.py with dynam
 ## Dependencies
 
 - Phase 1 (NodeTypeRegistry)
+- Phase 5 (Database API — backends need registry available)
+
+## 6-pre: Inject registry into backend classes
+
+Both backends need access to the registry. Add a `registry` parameter to each backend's
+constructor, or set it after construction from the database wrapper.
+
+**Recommended approach:** Pass via constructor.
+
+```python
+# In neo4j_backend.py — modify __init__:
+from ..type_registry import NodeTypeRegistry, get_default_registry, register_custom_types
+from ..query_builder import _validate_identifier
+
+class Neo4jBackend:
+    def __init__(self, connection, registry: NodeTypeRegistry = None):
+        self.connection = connection
+        if registry is None:
+            registry = get_default_registry()
+            register_custom_types(registry)
+        self.registry = registry
+
+# In sqlite_fallback.py — modify __init__:
+from ..type_registry import NodeTypeRegistry, get_default_registry, register_custom_types
+
+class SQLiteFallbackBackend:
+    def __init__(self, db_path: str, registry: NodeTypeRegistry = None, ...):
+        # ... existing init ...
+        if registry is None:
+            registry = get_default_registry()
+            register_custom_types(registry)
+        self.registry = registry
+```
+
+The default `registry=None` + auto-creation preserves backward compatibility — existing
+code that creates backends without a registry argument still works.
 
 ## 6A: Neo4j — Dynamic schema from registry
 
 Currently has 14 hardcoded statements like `CREATE INDEX FOR (m:Memory)`. Replace with registry loop.
+
+**Required import** (add to top of `neo4j_backend.py`):
+```python
+from ..query_builder import _validate_identifier
+```
 
 ```python
 # In neo4j_backend.py
@@ -100,8 +141,19 @@ async def initialize_schema(self) -> None:
 ## Tests: `tests/test_schema_manager.py`
 
 ```python
+import pytest
+import pytest_asyncio
+import tempfile
+from pathlib import Path
+from datetime import datetime, timezone
+from memorygraph.backends.sqlite_fallback import SQLiteFallbackBackend
+from memorygraph.sqlite_database import SQLiteMemoryDatabase
+from memorygraph.models import Memory, MemoryType, Transaction
+
+pytestmark = pytest.mark.asyncio  # All tests in this module are async
+
 class TestSchemaManager:
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def db(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = str(Path(tmpdir) / "test.db")

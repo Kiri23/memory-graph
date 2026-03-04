@@ -2,7 +2,7 @@
 
 **Status:** [ ] Not started
 **Files:** `src/memorygraph/tools/memory_tools.py` (MODIFY), `src/memorygraph/tools/search_tools.py` (MODIFY), `src/memorygraph/server.py` (MODIFY)
-**Gate:** `uv run pytest tests/test_multi_label_integration.py -v` — 6 integration tests
+**Gate:** `uv run pytest tests/test_multi_label_integration.py -v` — 9 tests (6 database + 3 MCP handler)
 
 ## What this does
 
@@ -54,9 +54,16 @@ async def handle_store_memory(context, kwargs):
         ...
     else:
         # Custom node type path
-        config = context.db.registry.get(node_type)
+        config = context.db.registry.get(node_type)  # raises KeyError if invalid
         model = config.model
-        node = model(**kwargs)  # Pydantic validates
+
+        # IMPORTANT: Filter kwargs to only fields the target model accepts.
+        # Without this, Memory-specific fields (type, title, content) that the
+        # LLM sends alongside node_type would cause Pydantic ValidationError.
+        valid_fields = set(model.model_fields.keys())
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+
+        node = model(**filtered_kwargs)  # Pydantic validates required fields
         node_id = await context.db.store_node(node_type, node)
         return CallToolResult(content=[TextContent(
             text=json.dumps({"memory_id": node_id, "node_type": node_type})
@@ -98,11 +105,26 @@ Handler routes to `search_nodes(type_name, filters)` when `node_type != "memory"
 
 ## Tests: `tests/test_multi_label_integration.py`
 
-End-to-end test proving the full chain:
+End-to-end tests proving BOTH the database layer AND the MCP handler routing:
 
 ```python
+import json
+import pytest
+import pytest_asyncio
+import tempfile
+from pathlib import Path
+from datetime import datetime, timezone
+from memorygraph.backends.sqlite_fallback import SQLiteFallbackBackend
+from memorygraph.sqlite_database import SQLiteMemoryDatabase
+from memorygraph.models import Memory, MemoryType, Transaction
+
+pytestmark = pytest.mark.asyncio  # All tests in this module are async
+
+
 class TestMultiLabelIntegration:
-    @pytest.fixture
+    """Database-level integration tests."""
+
+    @pytest_asyncio.fixture
     async def db(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = str(Path(tmpdir) / "integration.db")
@@ -177,6 +199,72 @@ class TestMultiLabelIntegration:
         assert isinstance(result, Transaction)
         assert result.context["project"] == "KiriInfra"
         assert result.context["service"] == "EC2"
+
+
+class TestMCPHandlerRouting:
+    """MCP tool handler tests — verifies the node_type routing logic.
+
+    These test the actual handler function, not just the database.
+    Uses a minimal mock context to simulate what server.py passes.
+    """
+
+    @pytest_asyncio.fixture
+    async def context(self):
+        """Create a minimal context with a real database for handler testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "handler_test.db")
+            backend = SQLiteFallbackBackend(db_path=db_path)
+            await backend.connect()
+            await backend.initialize_schema()
+            db = SQLiteMemoryDatabase(backend)
+            await db.initialize_schema()
+
+            class MockContext:
+                pass
+            ctx = MockContext()
+            ctx.db = db
+            yield ctx
+            await backend.disconnect()
+
+    async def test_handler_routes_transaction_via_node_type(self, context):
+        """store_memory with node_type='transaction' stores a Transaction, not Memory."""
+        from memorygraph.tools.memory_tools import handle_store_memory
+        result = await handle_store_memory(context, {
+            "node_type": "transaction",
+            "amount": 50.0,
+            "merchant": "Pueblo",
+            "category": "groceries",
+            "date": datetime.now(timezone.utc).isoformat(),
+        })
+        # Result should contain the node_id and node_type
+        result_data = json.loads(result.content[0].text)
+        assert result_data["node_type"] == "transaction"
+        # Verify it's actually stored as a Transaction
+        retrieved = await context.db.get_node(result_data["memory_id"])
+        assert isinstance(retrieved, Transaction)
+
+    async def test_handler_default_memory_path_unchanged(self, context):
+        """store_memory WITHOUT node_type still stores a Memory (backward compat)."""
+        from memorygraph.tools.memory_tools import handle_store_memory
+        result = await handle_store_memory(context, {
+            "type": "task",
+            "title": "Test task",
+            "content": "Some content",
+        })
+        result_data = json.loads(result.content[0].text)
+        retrieved = await context.db.get_memory(result_data["memory_id"])
+        assert isinstance(retrieved, Memory)
+        assert retrieved.title == "Test task"
+
+    async def test_handler_invalid_node_type_returns_error(self, context):
+        """store_memory with unknown node_type returns a clear error, not a crash."""
+        from memorygraph.tools.memory_tools import handle_store_memory
+        result = await handle_store_memory(context, {
+            "node_type": "nonexistent_type",
+            "data": "whatever",
+        })
+        result_text = result.content[0].text
+        assert "error" in result_text.lower() or "unknown" in result_text.lower()
 ```
 
 ## Acceptance Criteria
@@ -186,6 +274,7 @@ class TestMultiLabelIntegration:
 - [ ] `search_memories(node_type="transaction", category="groceries")` returns Transactions
 - [ ] `get_memory(id)` returns correct type regardless (via `get_node`)
 - [ ] `create_relationship` works between Transaction and Memory
-- [ ] Invalid `node_type` returns clear error message
-- [ ] All 6 integration tests pass
+- [ ] Invalid `node_type` returns clear error message (not a crash)
+- [ ] Handler filters kwargs to target model fields (no Memory fields leaking to Transaction)
+- [ ] All 9 tests pass (6 database integration + 3 MCP handler routing)
 - [ ] `uv run pytest tests/ -v` — zero regressions across entire suite

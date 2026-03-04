@@ -105,20 +105,43 @@ def register_custom_types(registry: NodeTypeRegistry) -> None:
 
 ## Tests: `tests/test_type_registry.py`
 
+> **IMPORTANT — DUMMY MODEL:** These tests use a lightweight `DummyCustomModel`
+> instead of the real `Transaction` model (which doesn't exist until Phase 3).
+> This keeps Phase 1 truly independent. After Phase 3 is complete, the
+> `test_all_types_with_custom_types` test should be **duplicated or extended**
+> in a post-Phase-3 integration test that calls `register_custom_types()` with
+> the real Transaction model. The dummy tests here remain valid — they prove the
+> registry mechanics work regardless of model type.
+
 ```python
+import pytest
+from pydantic import BaseModel
 from memorygraph.type_registry import (
     NodeTypeRegistry, NodeTypeConfig, get_default_registry
 )
-from memorygraph.models import Memory, Transaction
+from memorygraph.models import Memory
+
+
+# --- Dummy model for Phase 1 tests (Transaction doesn't exist yet) ---
+# DUMMY DATA: This model stands in for Transaction until Phase 3 creates it.
+# The registry doesn't care about model internals — it only stores the class
+# reference. Any BaseModel subclass proves the registry works correctly.
+class DummyCustomModel(BaseModel):
+    """Lightweight stand-in for custom node types. Replace with real
+    Transaction import after Phase 3 is implemented."""
+    id: str = None
+    name: str = "test"
+
 
 class TestNodeTypeRegistry:
     def test_register_and_retrieve(self):
         """Register a type, retrieve it by name."""
         registry = NodeTypeRegistry()
-        config = NodeTypeConfig(name="transaction", label="Transaction", model=Transaction, indexes=["id"])
+        # DUMMY DATA: Uses DummyCustomModel instead of Transaction (Phase 3)
+        config = NodeTypeConfig(name="custom", label="Custom", model=DummyCustomModel, indexes=["id"])
         registry.register(config)
-        assert registry.get_label("transaction") == "Transaction"
-        assert registry.get_model("transaction") == Transaction
+        assert registry.get_label("custom") == "Custom"
+        assert registry.get_model("custom") == DummyCustomModel
 
     def test_default_memory_type_registered(self):
         """The 'memory' type should be pre-registered."""
@@ -135,7 +158,8 @@ class TestNodeTypeRegistry:
     def test_duplicate_registration_raises(self):
         """Registering same name twice raises ValueError."""
         registry = NodeTypeRegistry()
-        config = NodeTypeConfig(name="tx", label="Tx", model=Transaction, indexes=[])
+        # DUMMY DATA: Uses DummyCustomModel instead of Transaction (Phase 3)
+        config = NodeTypeConfig(name="tx", label="Tx", model=DummyCustomModel, indexes=[])
         registry.register(config)
         with pytest.raises(ValueError, match="already registered"):
             registry.register(config)
@@ -146,15 +170,22 @@ class TestNodeTypeRegistry:
         assert len(registry.all_types()) == 1  # memory only
         assert registry.all_types()[0].name == "memory"
 
-    def test_all_types_with_custom_types(self):
-        """register_custom_types() adds Transaction to registry."""
-        from memorygraph.type_registry import register_custom_types
+    def test_register_multiple_custom_types(self):
+        """Registry supports multiple custom types alongside Memory.
+
+        NOTE — DUMMY DATA: This test uses DummyCustomModel to prove the
+        registry can hold multiple types. After Phase 3, add a separate
+        integration test that calls register_custom_types() with the real
+        Transaction model to verify the full wiring.
+        """
         registry = get_default_registry()
-        register_custom_types(registry)
-        assert len(registry.all_types()) == 2  # memory + transaction
+        registry.register(NodeTypeConfig(
+            name="custom", label="Custom", model=DummyCustomModel, indexes=["id"]
+        ))
+        assert len(registry.all_types()) == 2  # memory + custom
         names = [t.name for t in registry.all_types()]
         assert "memory" in names
-        assert "transaction" in names
+        assert "custom" in names
 
     def test_has_type(self):
         """has_type() returns True/False."""

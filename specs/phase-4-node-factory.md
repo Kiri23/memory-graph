@@ -76,7 +76,15 @@ class NodeFactory:
         return None
 
     def _pick_specific_label(self, labels: list[str]) -> str:
-        """Priority: non-Memory registered label > Memory > first > "Memory"."""
+        """Priority: non-Memory registered label > Memory > first > "Memory".
+
+        NOTE: If a node has multiple custom labels (e.g., ["Transaction", "Invoice"]),
+        this returns the first non-Memory match found during iteration. The order
+        depends on the `labels` list from Neo4j, which is not guaranteed to be stable.
+        This is acceptable for now because nodes will only have ONE custom label.
+        If multi-custom-label nodes are needed in the future, add a `priority: int`
+        field to NodeTypeConfig and sort by it here.
+        """
         memory_label = None
         for label in labels:
             config = self._resolve_type(label)
@@ -127,13 +135,15 @@ class NodeFactory:
 ## Tests: `tests/test_node_factory.py`
 
 ```python
+from datetime import datetime
 from memorygraph.node_factory import NodeFactory
-from memorygraph.type_registry import get_default_registry
+from memorygraph.type_registry import get_default_registry, register_custom_types
 from memorygraph.models import Memory, Transaction
 
 class TestNodeFactory:
     def setup_method(self):
         self.registry = get_default_registry()
+        register_custom_types(self.registry)  # Register Transaction (Phase 3 must be done first)
         self.factory = NodeFactory(self.registry)
 
     def test_memory_from_record(self):

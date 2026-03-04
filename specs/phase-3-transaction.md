@@ -2,7 +2,7 @@
 
 **Status:** [ ] Not started
 **File:** `src/memorygraph/models.py` (MODIFY)
-**Gate:** `uv run pytest tests/test_transaction_model.py -v` — 5 tests
+**Gate:** `uv run pytest tests/test_transaction_model.py -v` — 6 tests
 
 ## What this does
 
@@ -41,6 +41,18 @@ class Transaction(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+    @field_validator('date')
+    @classmethod
+    def ensure_timezone(cls, v: datetime) -> datetime:
+        """Ensure date is timezone-aware. Defaults to UTC if naive.
+
+        Prevents comparison issues with created_at/updated_at which are UTC.
+        Naive datetimes from user input (e.g., "2026-03-03T00:00:00") get UTC.
+        """
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
     @field_validator('tags')
     @classmethod
     def validate_tags(cls, v: List[str]) -> List[str]:
@@ -77,6 +89,7 @@ class Transaction(BaseModel):
 ## Tests: `tests/test_transaction_model.py`
 
 ```python
+import pytest
 from datetime import datetime, timezone
 from pydantic import ValidationError
 from memorygraph.models import Transaction
@@ -110,6 +123,13 @@ class TestTransactionModel:
         assert props["amount"] == 42.50
         assert props["merchant"] == "Pueblo"
         assert isinstance(props["date"], str)  # ISO string
+
+    def test_naive_date_gets_utc(self):
+        """Naive datetime (no timezone) is auto-converted to UTC."""
+        naive_dt = datetime(2026, 3, 3, 12, 0, 0)  # no tzinfo
+        t = Transaction(amount=10, merchant="Test", category="test", date=naive_dt)
+        assert t.date.tzinfo is not None
+        assert t.date.tzinfo == timezone.utc
 ```
 
 ## Acceptance Criteria
@@ -119,4 +139,5 @@ class TestTransactionModel:
 - [ ] Tags are auto-lowercased via `@field_validator`
 - [ ] `to_storage_properties()` returns flat dict suitable for both backends
 - [ ] `context` dict flattens to `context_*` keys in storage properties
-- [ ] All 5 tests pass
+- [ ] Naive datetimes (no timezone) are auto-converted to UTC
+- [ ] All 6 tests pass

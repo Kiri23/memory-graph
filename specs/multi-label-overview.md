@@ -32,16 +32,22 @@ AFTER:
 
 ```
 Phase 1: NodeTypeRegistry ──┐
-Phase 2: QueryBuilder ──────┤  (independent of each other)
+Phase 2: QueryBuilder ──────┤  (independent — tests use DUMMY models, not real Transaction)
 Phase 3: Transaction Model ─┤
                              ▼
 Phase 4: NodeFactory (needs 1 + 3)
                              ▼
 Phase 5: Database API (needs 1 + 2 + 3 + 4)
                              ▼
-Phase 6: Schema Manager (needs 1)
+Phase 6: Schema Manager (needs 1 + 5 — backends need registry injected via constructor)
 Phase 7: MCP Tools (needs 5)
 ```
+
+> **NOTE on Phase 1/2 independence:** Phase 1 and 2 tests use lightweight
+> dummy Pydantic models (not real Transaction) so they can run before Phase 3.
+> The dummy models are clearly marked with "DUMMY DATA" comments. After Phase 3
+> creates the real Transaction model, `register_custom_types()` wires it into
+> the registry — tested in Phase 4+ integration tests.
 
 ## Per-Phase Files
 
@@ -49,11 +55,11 @@ Phase 7: MCP Tools (needs 5)
 |-------|------|------|-------|
 | 1 | [phase-1-registry.md](phase-1-registry.md) | `uv run pytest tests/test_type_registry.py -v` | 7 |
 | 2 | [phase-2-query-builder.md](phase-2-query-builder.md) | `uv run pytest tests/test_query_builder.py tests/test_database.py -v` | 14 + existing |
-| 3 | [phase-3-transaction.md](phase-3-transaction.md) | `uv run pytest tests/test_transaction_model.py -v` | 5 |
+| 3 | [phase-3-transaction.md](phase-3-transaction.md) | `uv run pytest tests/test_transaction_model.py -v` | 6 |
 | 4 | [phase-4-node-factory.md](phase-4-node-factory.md) | `uv run pytest tests/test_node_factory.py -v` | 7 |
 | 5 | [phase-5-database-api.md](phase-5-database-api.md) | `uv run pytest tests/test_database_api.py -v` | 9 |
 | 6 | [phase-6-schema.md](phase-6-schema.md) | `uv run pytest tests/test_schema_manager.py tests/test_backward_compatibility.py -v` | 3+ |
-| 7 | [phase-7-mcp-tools.md](phase-7-mcp-tools.md) | `uv run pytest tests/test_multi_label_integration.py -v` | 6 |
+| 7 | [phase-7-mcp-tools.md](phase-7-mcp-tools.md) | `uv run pytest tests/test_multi_label_integration.py -v` | 9 |
 | **ALL** | — | `uv run pytest tests/ -v` | **Every test passes** |
 
 ## Files Changed (all phases)

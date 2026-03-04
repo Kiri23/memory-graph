@@ -94,6 +94,11 @@ class QueryBuilder:
         Special keys: "query" (text search), "tags" (ANY match), "min_importance" (threshold).
         All other keys: exact property match.
         Returns: (cypher_query, parameters) tuple
+
+        NOTE: Alias is always 'm' in search queries. The MATCH, WHERE, and RETURN
+        clauses are all generated together with 'm' as the node variable. Unlike
+        match()/create()/merge() which accept a custom alias parameter, search()
+        is self-contained and doesn't expose alias configuration.
         """
         label = _validate_identifier(self.registry.get_label(type_name), "label")
         conditions = []
@@ -137,16 +142,41 @@ query = f"{self.qb.match(node_type)} WHERE m.id = $id {self.qb.return_with_label
 
 ## Tests: `tests/test_query_builder.py`
 
+> **IMPORTANT — DUMMY MODEL:** These tests register a `DummyTransaction`
+> model in the registry instead of importing the real `Transaction` from
+> `models.py` (which doesn't exist until Phase 3). The QueryBuilder only
+> cares about the **label string** from the registry, not the model's fields.
+> This keeps Phase 2 independent of Phase 3. After Phase 3, the tests still
+> pass as-is — the dummy proves label routing; real Transaction tests happen
+> in Phase 5+.
+
 ```python
+import pytest
+from pydantic import BaseModel
 from memorygraph.query_builder import QueryBuilder, _validate_identifier
-from memorygraph.type_registry import NodeTypeConfig, get_default_registry
-from memorygraph.models import Transaction
+from memorygraph.type_registry import NodeTypeRegistry, NodeTypeConfig, get_default_registry
+
+
+# --- Dummy model for Phase 2 tests (Transaction doesn't exist yet) ---
+# DUMMY DATA: QueryBuilder never instantiates or inspects model fields.
+# It only reads config.label from the registry. Any BaseModel works.
+class DummyTransaction(BaseModel):
+    """Stand-in for Transaction. QueryBuilder only needs the label string."""
+    id: str = None
+
 
 class TestQueryBuilder:
     def setup_method(self):
-        from memorygraph.type_registry import register_custom_types
         self.registry = get_default_registry()
-        register_custom_types(self.registry)  # Need Transaction for these tests
+        # DUMMY DATA: Register a "transaction" type with DummyTransaction
+        # instead of calling register_custom_types() which needs real Transaction.
+        self.registry.register(NodeTypeConfig(
+            name="transaction",
+            label="Transaction",
+            model=DummyTransaction,
+            indexes=["id", "amount", "merchant", "category", "date"],
+            fulltext_fields=["merchant", "note"],
+        ))
         self.qb = QueryBuilder(self.registry)
 
     def test_match_memory_unchanged(self):

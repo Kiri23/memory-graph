@@ -75,12 +75,20 @@ class MemoryOperations(Protocol):
 
 ## 5A: SQLiteMemoryDatabase (sqlite_database.py)
 
+**Required new imports** (add to top of `sqlite_database.py`):
+```python
+import re  # for field name validation in search_nodes
+from .type_registry import get_default_registry, register_custom_types
+from .node_factory import NodeFactory
+```
+
 ```python
 # Added to SQLiteMemoryDatabase
 
 def __init__(self, backend: SQLiteFallbackBackend):
     self.backend = backend
     self.registry = get_default_registry()
+    register_custom_types(self.registry)  # Wire Transaction + future custom types
     self.factory = NodeFactory(self.registry)
 
 async def store_node(self, type_name: str, node: BaseModel) -> str:
@@ -198,12 +206,20 @@ async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
 
 ## 5B: MemoryDatabase (database.py — Neo4j path)
 
+**Required new imports** (add to top of `database.py`):
+```python
+from .type_registry import get_default_registry, register_custom_types
+from .node_factory import NodeFactory
+from .query_builder import QueryBuilder, _validate_identifier
+```
+
 ```python
 # Added to MemoryDatabase
 
 def __init__(self, connection):
     self.connection = connection
     self.registry = get_default_registry()
+    register_custom_types(self.registry)  # Wire Transaction + future custom types
     self.factory = NodeFactory(self.registry)
     self.qb = QueryBuilder(self.registry)
 
@@ -243,18 +259,23 @@ async def store_node(self, type_name: str, node: BaseModel) -> str:
     raise DatabaseConnectionError(f"Failed to store {type_name} node: {node_id}")
 
 async def get_node(self, node_id: str) -> Optional[BaseModel]:
-    """Retrieve any node by ID. Single query across all registered labels."""
-    all_labels = [
-        _validate_identifier(c.label, "label")
-        for c in self.registry.all_types()
-    ]
-    query = (
-        f"MATCH (m) WHERE m.id = $id "
-        f"AND ANY(lbl IN labels(m) WHERE lbl IN $registered_labels) "
-        f"RETURN m, labels(m) AS labels LIMIT 1"
-    )
+    """Retrieve any node by ID using label-specific UNION for index usage.
+
+    IMPORTANT: A bare `MATCH (m) WHERE m.id = $id` cannot use label-specific
+    indexes and causes a full graph scan. Instead, we UNION one MATCH per
+    registered label so Neo4j uses the per-label uniqueness index on `id`.
+    """
+    parts = []
+    for config in self.registry.all_types():
+        label = _validate_identifier(config.label, "label")
+        parts.append(
+            f"MATCH (m:{label}) WHERE m.id = $id "
+            f"RETURN m, labels(m) AS labels"
+        )
+    query = " UNION ".join(parts) + " LIMIT 1"
+
     result = await self.connection.execute_read_query(
-        query, {"id": node_id, "registered_labels": all_labels}
+        query, {"id": node_id}
     )
     if result:
         return self.factory.from_neo4j_record(result[0])
@@ -271,6 +292,7 @@ async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
 
 ```python
 import pytest
+import pytest_asyncio
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
@@ -278,8 +300,10 @@ from memorygraph.backends.sqlite_fallback import SQLiteFallbackBackend
 from memorygraph.sqlite_database import SQLiteMemoryDatabase
 from memorygraph.models import Memory, MemoryType, Transaction
 
+pytestmark = pytest.mark.asyncio  # All tests in this module are async
+
 class TestDatabaseAPI:
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def db(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = str(Path(tmpdir) / "test.db")
@@ -372,12 +396,37 @@ class TestDatabaseAPI:
 
 ## Implementation Notes
 
-**Concurrent write safety:** The SQLite SELECT-then-INSERT pattern is not atomic. Consider using `INSERT OR REPLACE` (UPSERT) instead:
+**Concurrent write safety:** The SQLite SELECT-then-INSERT pattern is not atomic. However,
+a naive `ON CONFLICT(id) DO UPDATE` UPSERT is **less safe** here because it ignores the
+`label` column — a conflicting ID from a different node type would silently overwrite the
+wrong node. The current SELECT-then-INSERT uses `WHERE id = ? AND label = ?` which is safer.
+
+If atomicity becomes a concern, the correct UPSERT requires a **composite unique constraint**:
 ```sql
+-- First, add composite unique constraint (in schema migration):
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_id_label ON nodes(id, label);
+
+-- Then UPSERT is safe:
 INSERT INTO nodes (id, label, properties, created_at, updated_at)
 VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-ON CONFLICT(id) DO UPDATE SET properties = excluded.properties, updated_at = CURRENT_TIMESTAMP
+ON CONFLICT(id, label) DO UPDATE SET properties = excluded.properties, updated_at = CURRENT_TIMESTAMP;
 ```
+
+For now, the SELECT-then-INSERT pattern is correct and sufficient for single-writer SQLite.
+
+## Known Gaps (deferred to follow-up)
+
+**`delete_node` not included:** This phase adds `store_node`, `get_node`, `search_nodes` but
+not `delete_node`. The existing `delete_memory` works by matching on node ID only (not label),
+so it will delete any node type. For this release, use `delete_memory(id)` to delete custom
+nodes. A typed `delete_node(node_id: str) -> bool` should be added in a follow-up if
+label-specific deletion behavior is needed.
+
+**`update_node` not included:** The existing `update_memory` is Memory-specific (it expects
+Memory fields like `type`, `title`, `content`). For custom types, `store_node` with an
+existing ID serves as the update path — the MERGE/upsert behavior overwrites all properties.
+A typed `update_node(node_id: str, type_name: str, **updates) -> BaseModel` that supports
+partial updates should be added in a follow-up.
 
 ## Acceptance Criteria
 
