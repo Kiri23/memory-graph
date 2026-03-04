@@ -39,6 +39,7 @@ async def mock_database():
     db.initialize_schema = AsyncMock()
     db.store_memory = AsyncMock()
     db.get_memory = AsyncMock()
+    db.get_node = AsyncMock(return_value=None)
     db.search_memories = AsyncMock()
     db.update_memory = AsyncMock()
     db.delete_memory = AsyncMock()
