@@ -119,6 +119,11 @@ class QueryBuilder:
         label = self.registry.get_label(type_name)
         return f"CREATE ({alias}:{label} $props)"
 
+    def merge(self, type_name: str, key_field: str = "id", alias: str = "m") -> str:
+        """MERGE = create-or-update (upsert). Used by store_memory."""
+        label = self.registry.get_label(type_name)
+        return f"MERGE ({alias}:{label} {{{key_field}: ${key_field}}})"
+
     def search(self, type_name: str, filters: dict) -> tuple[str, dict]:
         # Returns (cypher_query, parameters)
         ...
@@ -409,6 +414,14 @@ class TestQueryBuilder:
     def test_create_transaction(self):
         """create('transaction') produces Transaction label."""
         assert "CREATE (m:Transaction" in self.qb.create("transaction")
+
+    def test_merge_memory_unchanged(self):
+        """merge('memory') produces MERGE with :Memory label (upsert)."""
+        assert self.qb.merge("memory") == "MERGE (m:Memory {id: $id})"
+
+    def test_merge_transaction(self):
+        """merge('transaction') produces MERGE with :Transaction label."""
+        assert self.qb.merge("transaction") == "MERGE (m:Transaction {id: $id})"
 
     def test_custom_alias(self):
         """Can use custom alias."""
