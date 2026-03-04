@@ -9,10 +9,12 @@ memory storage without requiring Neo4j.
 import asyncio
 import logging
 import json
+import re
 import uuid
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta, timezone
 
+from pydantic import BaseModel
 from .models import (
     Memory, MemoryType, MemoryNode, Relationship, RelationshipType,
     RelationshipProperties, SearchQuery, MemoryContext,
@@ -22,6 +24,8 @@ from .models import (
 from .backends.sqlite_fallback import SQLiteFallbackBackend
 from .config import Config
 from .utils.graph_algorithms import has_cycle
+from .type_registry import get_default_registry, register_custom_types
+from .node_factory import NodeFactory
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +161,126 @@ class SQLiteMemoryDatabase:
             backend: SQLiteFallbackBackend instance
         """
         self.backend = backend
+        self.registry = get_default_registry()
+        register_custom_types(self.registry)
+        self.factory = NodeFactory(self.registry)
+
+    async def store_node(self, type_name: str, node: BaseModel) -> str:
+        """Store any registered node type. Does NOT mutate the input node."""
+        config = self.registry.get(type_name)  # raises KeyError if unknown
+        label = config.label
+
+        node_id = node.id if hasattr(node, 'id') and node.id else str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+
+        if hasattr(node, 'to_storage_properties'):
+            properties = node.to_storage_properties()
+        else:
+            properties = node.model_dump(mode='python')
+            for k, v in properties.items():
+                if isinstance(v, datetime):
+                    properties[k] = v.isoformat()
+
+        properties['id'] = node_id
+        properties['updated_at'] = now.isoformat()
+
+        existing = await asyncio.to_thread(
+            self.backend.execute_sync,
+            "SELECT id, properties FROM nodes WHERE id = ? AND label = ?",
+            (node_id, label)
+        )
+
+        if existing:
+            old_props = json.loads(existing[0]['properties'])
+            if 'created_at' in old_props:
+                properties['created_at'] = old_props['created_at']
+
+            properties_json = json.dumps(properties)
+            await asyncio.to_thread(
+                self.backend.execute_sync,
+                "UPDATE nodes SET properties = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND label = ?",
+                (properties_json, node_id, label)
+            )
+        else:
+            properties_json = json.dumps(properties)
+            await asyncio.to_thread(
+                self.backend.execute_sync,
+                "INSERT INTO nodes (id, label, properties, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                (node_id, label, properties_json)
+            )
+
+        self.backend.commit()
+        return node_id
+
+    async def get_node(self, node_id: str) -> Optional[BaseModel]:
+        """Retrieve any node by ID, returning the correct model type."""
+        result = await asyncio.to_thread(
+            self.backend.execute_sync,
+            "SELECT label, properties FROM nodes WHERE id = ?",
+            (node_id,)
+        )
+
+        if not result:
+            return None
+
+        label = result[0]['label']
+        properties = json.loads(result[0]['properties'])
+        return self.factory.from_record(properties, label)
+
+    async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
+        """Search nodes of a specific type with property filters."""
+        config = self.registry.get(type_name)
+        label = config.label
+
+        filters = dict(filters)  # copy to avoid mutating caller's dict
+        limit = int(filters.pop("limit", 100))
+        offset = int(filters.pop("offset", 0))
+
+        where_parts = ["label = ?"]
+        params: list = [label]
+
+        _SPECIAL_KEYS = {"query", "tags", "min_importance"}
+
+        for key, value in filters.items():
+            if key == "query" and value:
+                pattern = f"%{value}%"
+                text_fields = config.fulltext_fields or ["title", "content"]
+                field_clauses = [
+                    f"json_extract(properties, '$.{f}') LIKE ?"
+                    for f in text_fields
+                ]
+                where_parts.append(f"({' OR '.join(field_clauses)})")
+                params.extend([pattern] * len(text_fields))
+            elif key == "tags" and value:
+                tag_conditions = []
+                for tag in value:
+                    tag_conditions.append("properties LIKE ?")
+                    params.append(f'%"{tag}"%')
+                where_parts.append(f"({' OR '.join(tag_conditions)})")
+            elif key == "min_importance" and value is not None:
+                where_parts.append("CAST(json_extract(properties, '$.importance') AS REAL) >= ?")
+                params.append(value)
+            elif key in _SPECIAL_KEYS:
+                continue
+            else:
+                if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key):
+                    raise ValueError(f"Invalid filter field: {key!r}")
+                where_parts.append(f"json_extract(properties, '$.{key}') = ?")
+                params.append(value)
+
+        sql = (
+            f"SELECT label, properties FROM nodes WHERE {' AND '.join(where_parts)}"
+            f" ORDER BY updated_at DESC LIMIT {limit} OFFSET {offset}"
+        )
+        rows = await asyncio.to_thread(self.backend.execute_sync, sql, tuple(params))
+
+        results = []
+        for row in rows:
+            props = json.loads(row['properties'])
+            node = self.factory.from_record(props, row['label'])
+            if node:
+                results.append(node)
+        return results
 
     async def initialize_schema(self) -> None:
         """
@@ -1017,15 +1141,15 @@ class SQLiteMemoryDatabase:
             # Serialize properties as JSON
             properties_json = json.dumps(props_dict)
 
-            # Verify both memories exist
+            # Verify both nodes exist (any label — supports cross-type relationships)
             from_exists = await asyncio.to_thread(
                 self.backend.execute_sync,
-                "SELECT id FROM nodes WHERE id = ? AND label = 'Memory'",
+                "SELECT id FROM nodes WHERE id = ?",
                 (from_memory_id,)
             )
             to_exists = await asyncio.to_thread(
                 self.backend.execute_sync,
-                "SELECT id FROM nodes WHERE id = ? AND label = 'Memory'",
+                "SELECT id FROM nodes WHERE id = ?",
                 (to_memory_id,)
             )
 
