@@ -130,7 +130,15 @@ async def handle_get_memory(
     memory = await memory_db.get_memory(memory_id, include_relationships)
 
     if not memory:
-        # Fallback to get_node() for custom node types
+        # Fallback to get_node() for custom node types (only available on some backends)
+        if not hasattr(memory_db, 'get_node'):
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Memory not found: {memory_id}"
+                )],
+                isError=True
+            )
         node = await memory_db.get_node(memory_id)
         if node is None:
             return CallToolResult(

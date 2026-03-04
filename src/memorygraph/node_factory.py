@@ -14,7 +14,7 @@ class NodeFactory:
     def __init__(self, registry: NodeTypeRegistry):
         self.registry = registry
 
-    def from_record(self, properties: dict[str, Any], label: str) -> BaseModel:
+    def from_record(self, properties: dict[str, Any], label: str) -> Optional[BaseModel]:
         """Deserialize a storage record to the correct Python model.
 
         Unified entry point for BOTH backends:
@@ -32,7 +32,7 @@ class NodeFactory:
 
         return parse_memory_from_properties(properties, source="NodeFactory-fallback")
 
-    def from_neo4j_record(self, record: dict[str, Any]) -> BaseModel:
+    def from_neo4j_record(self, record: dict[str, Any]) -> Optional[BaseModel]:
         """Convenience for Neo4j .data() results.
 
         Expects {"m": {props}, "labels": [str]} from RETURN m, labels(m) AS labels.

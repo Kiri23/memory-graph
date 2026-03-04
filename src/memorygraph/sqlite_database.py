@@ -218,7 +218,7 @@ class SQLiteMemoryDatabase:
 
             self.backend.commit()
         except Exception:
-            self.backend.conn.rollback()
+            self.backend.rollback()
             raise
         return node_id
 
@@ -243,8 +243,8 @@ class SQLiteMemoryDatabase:
         label = config.label
 
         filters = dict(filters)  # copy to avoid mutating caller's dict
-        limit = int(filters.pop("limit", 100))
-        offset = int(filters.pop("offset", 0))
+        limit = max(1, min(int(filters.pop("limit", 100)), 1000))
+        offset = max(0, int(filters.pop("offset", 0)))
 
         where_parts = ["label = ?"]
         params: list = [label]
