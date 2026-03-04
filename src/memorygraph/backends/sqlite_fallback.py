@@ -53,6 +53,11 @@ class SQLiteFallbackBackend(GraphBackend):
         self.graph: Optional[nx.DiGraph] = None  # type: ignore[misc,no-any-unimported]
         self._connected = False
 
+        # Registry for dynamic schema generation (Phase 6)
+        from ..type_registry import get_default_registry, register_custom_types
+        self.registry = get_default_registry()
+        register_custom_types(self.registry)
+
         # Ensure directory exists
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -206,6 +211,28 @@ class SQLiteFallbackBackend(GraphBackend):
                 CREATE INDEX IF NOT EXISTS idx_relationships_recorded
                 ON relationships(recorded_at)
             """)
+
+            # Per-type JSON indexes from registry (Phase 6)
+            from ..query_builder import _validate_identifier
+            for type_config in self.registry.all_types():
+                label = _validate_identifier(type_config.label, "label")
+                try:
+                    cursor.execute(
+                        f"CREATE INDEX IF NOT EXISTS idx_nodes_{label.lower()} "
+                        f"ON nodes(label) WHERE label = '{label}'"
+                    )
+                except sqlite3.Error as e:
+                    logger.warning("Skipping label index for %s: %s", label, e)
+                for field_name in type_config.indexes:
+                    field_name = _validate_identifier(field_name, "index_field")
+                    try:
+                        cursor.execute(
+                            f"CREATE INDEX IF NOT EXISTS idx_{label.lower()}_{field_name} "
+                            f"ON nodes(json_extract(properties, '$.{field_name}')) "
+                            f"WHERE label = '{label}'"
+                        )
+                    except sqlite3.Error as e:
+                        logger.warning("Skipping property index %s.%s: %s", label, field_name, e)
 
             # Conditional multi-tenant indexes (Phase 1)
             if Config.is_multi_tenant_mode():

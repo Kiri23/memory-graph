@@ -8,6 +8,7 @@ This module contains handlers for basic memory operations:
 - delete_memory: Remove a memory and its relationships
 """
 
+import json
 import logging
 from typing import Any, Dict
 
@@ -43,6 +44,40 @@ async def handle_store_memory(
     Returns:
         CallToolResult with memory ID on success or error message on failure
     """
+    # Branch on node_type BEFORE validate_memory_input()
+    node_type = arguments.get("node_type", "memory")
+    arguments = {k: v for k, v in arguments.items() if k != "node_type"}
+
+    if node_type != "memory":
+        if not hasattr(memory_db, 'registry'):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: This backend does not support custom node types.")],
+                isError=True
+            )
+        try:
+            config = memory_db.registry.get(node_type)
+        except KeyError:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Error: Unknown node type '{node_type}'. "
+                         f"Registered types: {[t.name for t in memory_db.registry.all_types()]}"
+                )],
+                isError=True
+            )
+
+        model = config.model
+        valid_fields = set(model.model_fields.keys())
+        filtered_args = {k: v for k, v in arguments.items() if k in valid_fields}
+
+        node = model(**filtered_args)
+        node_id = await memory_db.store_node(node_type, node)
+        return CallToolResult(content=[TextContent(
+            type="text",
+            text=json.dumps({"memory_id": node_id, "node_type": node_type})
+        )])
+
+    # --- Existing Memory code path — unchanged below this line ---
     # Validate input arguments
     validate_memory_input(arguments)
 
@@ -95,13 +130,38 @@ async def handle_get_memory(
     memory = await memory_db.get_memory(memory_id, include_relationships)
 
     if not memory:
-        return CallToolResult(
-            content=[TextContent(
-                type="text",
-                text=f"Memory not found: {memory_id}"
-            )],
-            isError=True
-        )
+        # Fallback to get_node() for custom node types (only available on some backends)
+        if not hasattr(memory_db, 'get_node'):
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Memory not found: {memory_id}"
+                )],
+                isError=True
+            )
+        node = await memory_db.get_node(memory_id)
+        if node is None:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Memory not found: {memory_id}"
+                )],
+                isError=True
+            )
+        # Resolve type name from registry (not class name)
+        node_type_name = "unknown"
+        if hasattr(memory_db, 'registry'):
+            for cfg in memory_db.registry.all_types():
+                if cfg.model == type(node):
+                    node_type_name = cfg.name
+                    break
+
+        node_data = json.loads(node.model_dump_json())
+        result_text = f"**{node_type_name.title()}** (ID: {memory_id})\n"
+        for k, v in node_data.items():
+            if v is not None and k != "id":
+                result_text += f"{k}: {v}\n"
+        return CallToolResult(content=[TextContent(type="text", text=result_text)])
 
     # Format memory for display
     memory_text = f"""**Memory: {memory.title}**

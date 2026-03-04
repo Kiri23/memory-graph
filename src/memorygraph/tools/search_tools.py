@@ -7,6 +7,7 @@ This module contains handlers for search operations:
 - contextual_search: Search only within related memories (scoped search)
 """
 
+import json
 import logging
 from typing import Any, Dict, Set, List
 
@@ -46,6 +47,50 @@ async def handle_search_memories(
     Returns:
         CallToolResult with formatted search results or error message
     """
+    node_type = arguments.get("node_type", "memory")
+    arguments = {k: v for k, v in arguments.items() if k != "node_type"}
+
+    if node_type != "memory":
+        if not hasattr(memory_db, 'registry'):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: This backend does not support custom node types.")],
+                isError=True
+            )
+        try:
+            config = memory_db.registry.get(node_type)
+        except KeyError:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Error: Unknown node type '{node_type}'."
+                )],
+                isError=True
+            )
+
+        _STRIP_KEYS = {"search_tolerance", "match_mode",
+                      "relationship_filter", "include_relationships"}
+        filters = {k: v for k, v in arguments.items() if k not in _STRIP_KEYS}
+
+        results = await memory_db.search_nodes(node_type, filters)
+
+        if not results:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"No {node_type} nodes found.")]
+            )
+
+        results_text = f"Found {len(results)} {node_type} nodes:\n\n"
+        for i, node in enumerate(results, 1):
+            node_data = json.loads(node.model_dump_json())
+            node_id = node_data.get("id", "?")
+            results_text += f"**{i}. {node_type.title()}** (ID: {node_id})\n"
+            for k, v in node_data.items():
+                if v is not None and k != "id":
+                    results_text += f"{k}: {v}\n"
+            results_text += "\n"
+
+        return CallToolResult(content=[TextContent(type="text", text=results_text)])
+
+    # --- Existing Memory search path — unchanged below ---
     # Validate input arguments
     validate_search_input(arguments)
 

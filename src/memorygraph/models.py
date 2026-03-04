@@ -292,6 +292,54 @@ class Memory(BaseModel):
         return v.strip()
 
 
+class Transaction(BaseModel):
+    """Domain-specific model for financial transactions."""
+    id: Optional[str] = None
+    amount: float
+    merchant: str
+    category: str  # groceries, dining, transport, etc.
+    currency: str = "USD"
+    payment_method: str = "unknown"  # google_pay, cash, credit, ath_movil
+    date: datetime
+    tags: List[str] = Field(default_factory=list)
+    importance: float = Field(default=0.3, ge=0.0, le=1.0)
+    note: Optional[str] = None
+    context: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator('date')
+    @classmethod
+    def ensure_timezone(cls, v: datetime) -> datetime:
+        """Ensure date is timezone-aware. Defaults to UTC if naive."""
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
+    @field_validator('tags')
+    @classmethod
+    def validate_tags(cls, v: List[str]) -> List[str]:
+        """Normalize tags to lowercase (same behavior as Memory)."""
+        return [tag.lower().strip() for tag in v if tag.strip()]
+
+    def to_storage_properties(self) -> Dict[str, Any]:
+        """Convert to flat dict for storage (both Neo4j and SQLite).
+
+        Context dict is flattened to context_* keys (same convention as Memory)
+        so NodeFactory._normalize_properties() can regroup them on read.
+        """
+        props = self.model_dump(mode='python')
+        # Flatten context dict to context_* keys
+        context = props.pop('context', {})
+        for ctx_key, ctx_value in context.items():
+            props[f'context_{ctx_key}'] = ctx_value
+        # Convert datetimes to ISO strings
+        for key, value in props.items():
+            if isinstance(value, datetime):
+                props[key] = value.isoformat()
+        return props
+
+
 class RelationshipProperties(BaseModel):
     """Properties for relationships between memories.
 
