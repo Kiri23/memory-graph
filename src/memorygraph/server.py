@@ -203,7 +203,7 @@ Returns memory_id. Use create_relationship to link related memories.""",
                         "currency": {"type": "string", "description": "Currency code (optional, default: 'USD')"},
                         "date": {"type": "string", "description": "Transaction date in ISO format (required for node_type=transaction)"}
                     },
-                    "required": ["type", "title", "content"]
+                    "required": []
                 }
             ),
             Tool(
