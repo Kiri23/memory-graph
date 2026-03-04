@@ -164,6 +164,7 @@ class SQLiteMemoryDatabase:
         self.registry = get_default_registry()
         register_custom_types(self.registry)
         self.factory = NodeFactory(self.registry)
+        self.backend.registry = self.registry  # Share registry with backend
 
     async def store_node(self, type_name: str, node: BaseModel) -> str:
         """Store any registered node type. Does NOT mutate the input node."""
