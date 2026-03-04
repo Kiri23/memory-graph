@@ -175,7 +175,8 @@ class TestToolSchemas:
         assert "type" in schema["properties"]
         assert "title" in schema["properties"]
         assert "content" in schema["properties"]
-        assert set(schema["required"]) == {"type", "title", "content"}
+        # required is empty — validation happens in handler based on node_type
+        assert schema["required"] == []
 
     def test_search_memories_schema(self):
         """Test search_memories tool schema."""
