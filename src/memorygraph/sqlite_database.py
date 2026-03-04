@@ -178,7 +178,12 @@ class SQLiteMemoryDatabase:
             properties = node.to_storage_properties()
         else:
             properties = node.model_dump(mode='python')
-            for k, v in properties.items():
+            # Flatten context dict to context_* keys (consistent with Memory/Transaction)
+            context = properties.pop('context', None)
+            if isinstance(context, dict):
+                for ctx_key, ctx_value in context.items():
+                    properties[f'context_{ctx_key}'] = ctx_value
+            for k, v in list(properties.items()):
                 if isinstance(v, datetime):
                     properties[k] = v.isoformat()
 
@@ -191,26 +196,30 @@ class SQLiteMemoryDatabase:
             (node_id, label)
         )
 
-        if existing:
-            old_props = json.loads(existing[0]['properties'])
-            if 'created_at' in old_props:
-                properties['created_at'] = old_props['created_at']
+        try:
+            if existing:
+                old_props = json.loads(existing[0]['properties'])
+                if 'created_at' in old_props:
+                    properties['created_at'] = old_props['created_at']
 
-            properties_json = json.dumps(properties)
-            await asyncio.to_thread(
-                self.backend.execute_sync,
-                "UPDATE nodes SET properties = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND label = ?",
-                (properties_json, node_id, label)
-            )
-        else:
-            properties_json = json.dumps(properties)
-            await asyncio.to_thread(
-                self.backend.execute_sync,
-                "INSERT INTO nodes (id, label, properties, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-                (node_id, label, properties_json)
-            )
+                properties_json = json.dumps(properties)
+                await asyncio.to_thread(
+                    self.backend.execute_sync,
+                    "UPDATE nodes SET properties = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND label = ?",
+                    (properties_json, node_id, label)
+                )
+            else:
+                properties_json = json.dumps(properties)
+                await asyncio.to_thread(
+                    self.backend.execute_sync,
+                    "INSERT INTO nodes (id, label, properties, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                    (node_id, label, properties_json)
+                )
 
-        self.backend.commit()
+            self.backend.commit()
+        except Exception:
+            self.backend.conn.rollback()
+            raise
         return node_id
 
     async def get_node(self, node_id: str) -> Optional[BaseModel]:
@@ -246,6 +255,9 @@ class SQLiteMemoryDatabase:
             if key == "query" and value:
                 pattern = f"%{value}%"
                 text_fields = config.fulltext_fields or ["title", "content"]
+                for f in text_fields:
+                    if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', f):
+                        raise ValueError(f"Invalid fulltext field: {f!r}")
                 field_clauses = [
                     f"json_extract(properties, '$.{f}') LIKE ?"
                     for f in text_fields
@@ -255,8 +267,10 @@ class SQLiteMemoryDatabase:
             elif key == "tags" and value:
                 tag_conditions = []
                 for tag in value:
-                    tag_conditions.append("properties LIKE ?")
-                    params.append(f'%"{tag}"%')
+                    tag_conditions.append(
+                        "EXISTS (SELECT 1 FROM json_each(json_extract(properties, '$.tags')) WHERE value = ?)"
+                    )
+                    params.append(tag)
                 where_parts.append(f"({' OR '.join(tag_conditions)})")
             elif key == "min_importance" and value is not None:
                 where_parts.append("CAST(json_extract(properties, '$.importance') AS REAL) >= ?")

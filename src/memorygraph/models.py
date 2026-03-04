@@ -328,23 +328,15 @@ class Transaction(BaseModel):
         Context dict is flattened to context_* keys (same convention as Memory)
         so NodeFactory._normalize_properties() can regroup them on read.
         """
-        props = {
-            'id': self.id,
-            'amount': self.amount,
-            'merchant': self.merchant,
-            'category': self.category,
-            'currency': self.currency,
-            'payment_method': self.payment_method,
-            'date': self.date.isoformat(),
-            'tags': self.tags,
-            'importance': self.importance,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat(),
-        }
-        if self.note:
-            props['note'] = self.note
-        for ctx_key, ctx_value in self.context.items():
+        props = self.model_dump(mode='python')
+        # Flatten context dict to context_* keys
+        context = props.pop('context', {})
+        for ctx_key, ctx_value in context.items():
             props[f'context_{ctx_key}'] = ctx_value
+        # Convert datetimes to ISO strings
+        for key, value in props.items():
+            if isinstance(value, datetime):
+                props[key] = value.isoformat()
         return props
 
 

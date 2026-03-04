@@ -72,13 +72,16 @@ class QueryBuilder:
 
         _SPECIAL_KEYS = {"query", "tags", "min_importance"}
 
+        config = self.registry.get(type_name)
+
         for key, value in filters.items():
             if key == "query" and value:
-                conditions.append(
-                    "(m.title CONTAINS $search_query OR "
-                    "m.content CONTAINS $search_query OR "
-                    "m.summary CONTAINS $search_query)"
-                )
+                text_fields = config.fulltext_fields or ["title", "content"]
+                field_clauses = [
+                    f"m.{_validate_identifier(f, 'fulltext_field')} CONTAINS $search_query"
+                    for f in text_fields
+                ]
+                conditions.append(f"({' OR '.join(field_clauses)})")
                 params["search_query"] = value
             elif key == "tags" and value:
                 conditions.append("ANY(tag IN $filter_tags WHERE tag IN m.tags)")

@@ -45,9 +45,15 @@ async def handle_store_memory(
         CallToolResult with memory ID on success or error message on failure
     """
     # Branch on node_type BEFORE validate_memory_input()
-    node_type = arguments.pop("node_type", "memory")
+    node_type = arguments.get("node_type", "memory")
+    arguments = {k: v for k, v in arguments.items() if k != "node_type"}
 
     if node_type != "memory":
+        if not hasattr(memory_db, 'registry'):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: This backend does not support custom node types.")],
+                isError=True
+            )
         try:
             config = memory_db.registry.get(node_type)
         except KeyError:
@@ -134,13 +140,20 @@ async def handle_get_memory(
                 )],
                 isError=True
             )
-        return CallToolResult(content=[TextContent(
-            type="text",
-            text=json.dumps({
-                "node_type": type(node).__name__.lower(),
-                "data": json.loads(node.model_dump_json())
-            })
-        )])
+        # Resolve type name from registry (not class name)
+        node_type_name = "unknown"
+        if hasattr(memory_db, 'registry'):
+            for cfg in memory_db.registry.all_types():
+                if cfg.model == type(node):
+                    node_type_name = cfg.name
+                    break
+
+        node_data = json.loads(node.model_dump_json())
+        result_text = f"**{node_type_name.title()}** (ID: {memory_id})\n"
+        for k, v in node_data.items():
+            if v is not None and k != "id":
+                result_text += f"{k}: {v}\n"
+        return CallToolResult(content=[TextContent(type="text", text=result_text)])
 
     # Format memory for display
     memory_text = f"""**Memory: {memory.title}**

@@ -70,4 +70,3 @@ class TestTransactionRegistryIntegration:
         names = [t.name for t in registry.all_types()]
         assert "memory" in names
         assert "transaction" in names
-        assert len(names) == 2

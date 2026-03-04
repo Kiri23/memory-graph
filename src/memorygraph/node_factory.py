@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional, Union
 from pydantic import BaseModel
@@ -5,6 +6,8 @@ from pydantic import BaseModel
 from .type_registry import NodeTypeRegistry, NodeTypeConfig
 from .models import Memory
 from .utils.memory_parser import parse_memory_from_properties
+
+logger = logging.getLogger(__name__)
 
 
 class NodeFactory:
@@ -83,8 +86,8 @@ class NodeFactory:
                 ):
                     try:
                         value = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                    except (ValueError, AttributeError):
-                        pass
+                    except (ValueError, AttributeError) as e:
+                        logger.warning("Failed to parse datetime for field '%s': %s (value: %r)", key, e, value)
 
             props[key] = value
 

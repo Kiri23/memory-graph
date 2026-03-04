@@ -221,8 +221,8 @@ class SQLiteFallbackBackend(GraphBackend):
                         f"CREATE INDEX IF NOT EXISTS idx_nodes_{label.lower()} "
                         f"ON nodes(label) WHERE label = '{label}'"
                     )
-                except sqlite3.Error:
-                    pass
+                except sqlite3.Error as e:
+                    logger.warning("Skipping label index for %s: %s", label, e)
                 for field_name in type_config.indexes:
                     field_name = _validate_identifier(field_name, "index_field")
                     try:
@@ -231,8 +231,8 @@ class SQLiteFallbackBackend(GraphBackend):
                             f"ON nodes(json_extract(properties, '$.{field_name}')) "
                             f"WHERE label = '{label}'"
                         )
-                    except sqlite3.Error:
-                        pass
+                    except sqlite3.Error as e:
+                        logger.warning("Skipping property index %s.%s: %s", label, field_name, e)
 
             # Conditional multi-tenant indexes (Phase 1)
             if Config.is_multi_tenant_mode():

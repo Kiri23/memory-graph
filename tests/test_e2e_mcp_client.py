@@ -344,6 +344,7 @@ class TestE2EMCPClient:
                     "node_type": "nonexistent_type",
                     "data": "whatever",
                 })
+                assert result.isError, "Expected isError=True for invalid node_type"
                 result_text = result.content[0].text.lower()
                 assert "error" in result_text or "unknown" in result_text
             finally:

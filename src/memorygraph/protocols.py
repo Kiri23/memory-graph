@@ -3,6 +3,7 @@ from typing import Any, List, Optional, Protocol, Tuple
 
 from pydantic import BaseModel
 from .models import Memory, Relationship, SearchQuery
+from .type_registry import NodeTypeRegistry
 
 
 class MemoryOperations(Protocol):
@@ -14,6 +15,8 @@ class MemoryOperations(Protocol):
 
     Use this protocol for type hints when you need to work with any backend type.
     """
+
+    registry: NodeTypeRegistry
 
     async def store_memory(self, memory: Memory) -> str:
         """Store a memory and return its ID."""
