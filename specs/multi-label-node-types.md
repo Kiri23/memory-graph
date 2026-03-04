@@ -4,7 +4,7 @@
 **Author:** Christian Nogueras
 **Branch:** `feature/multi-label-node-types`
 **Created:** 2026-03-03
-**Last revised:** 2026-03-03
+**Last revised:** 2026-03-03 (rev2: fixed 10 spec issues — see git diff)
 
 ## Goal
 
@@ -135,7 +135,11 @@ class NodeTypeRegistry:
 
 
 def get_default_registry() -> NodeTypeRegistry:
-    """Create registry with default Memory type pre-registered."""
+    """Create registry with default Memory type pre-registered.
+
+    NOTE: Only registers 'memory' here. Custom types (e.g. Transaction)
+    are added in their own phases via register_custom_types().
+    """
     from .models import Memory
     registry = NodeTypeRegistry()
     registry.register(NodeTypeConfig(
@@ -146,11 +150,33 @@ def get_default_registry() -> NodeTypeRegistry:
         fulltext_fields=["title", "content", "summary"],
     ))
     return registry
+
+
+def register_custom_types(registry: NodeTypeRegistry) -> None:
+    """Register custom node types. Called after Phase 3 models exist.
+
+    Separate from get_default_registry() to avoid a circular dependency:
+    Phase 1 defines the registry, Phase 3 defines Transaction, then
+    this function wires them together.
+    """
+    from .models import Transaction
+    registry.register(NodeTypeConfig(
+        name="transaction",
+        label="Transaction",
+        model=Transaction,
+        indexes=["id", "amount", "merchant", "category", "date"],
+        fulltext_fields=["merchant", "note"],
+        relationship_constraints=[
+            RelationshipConstraint(rel_type="RELATED_TO", target_label="*"),
+            RelationshipConstraint(rel_type="CATEGORIZED_AS", target_label="Memory"),
+        ]
+    ))
 ```
 
 **Acceptance criteria:**
 - [ ] Registry can register and retrieve type configs
 - [ ] Default "memory" type is pre-registered via `get_default_registry()`
+- [ ] `register_custom_types()` adds Transaction (and future custom types)
 - [ ] Unknown type raises `KeyError` with helpful message listing registered types
 - [ ] Duplicate registration raises `ValueError`
 - [ ] `all_types()` returns all registered configs
@@ -163,6 +189,19 @@ def get_default_registry() -> NodeTypeRegistry:
 **Files:** `src/memorygraph/query_builder.py` (NEW), `src/memorygraph/database.py` (MODIFY)
 
 Replaces ~26 hardcoded `:Memory` Cypher strings with parameterized queries. Also validates relationship types interpolated into Cypher (fixing existing injection vulnerability at database.py:830).
+
+**Vulnerable code being replaced** (database.py:830):
+```python
+# BEFORE — relationship_type.value is user-derived (from MCP tool input)
+# and interpolated directly into Cypher without validation:
+query = f"MATCH (from:Memory {{id: $from_id}})-[r:{relationship_type.value}]->(to:Memory {{id: $to_id}}) ..."
+# An attacker could pass relationship_type="RELATED_TO]->(x) DETACH DELETE x //"
+# which would delete nodes.
+
+# AFTER — QueryBuilder.relationship_match() validates all identifiers:
+query = f"{self.qb.relationship_match('memory', 'memory', relationship_type.value)} ..."
+# _validate_identifier() rejects anything not matching [A-Za-z_][A-Za-z0-9_]*
+```
 
 ```python
 import re
@@ -192,12 +231,16 @@ class QueryBuilder:
         alias = _validate_identifier(alias, "alias")
         return f"CREATE ({alias}:{label} $props)"
 
-    def merge(self, type_name: str, key_field: str = "id", alias: str = "m") -> str:
-        """MERGE = create-or-update (upsert). Primary method for store operations."""
+    def merge(self, type_name: str, alias: str = "m") -> str:
+        """MERGE = create-or-update (upsert). Primary method for store operations.
+
+        Always merges on `id` — consistent with match() and create() signatures.
+        The MERGE key is hardcoded to `id` because all node types use UUID ids
+        as their unique identifier.
+        """
         label = _validate_identifier(self.registry.get_label(type_name), "label")
         alias = _validate_identifier(alias, "alias")
-        key_field = _validate_identifier(key_field, "key_field")
-        return f"MERGE ({alias}:{label} {{{key_field}: ${key_field}}})"
+        return f"MERGE ({alias}:{label} {{id: $id}})"
 
     def return_with_labels(self, alias: str = "m") -> str:
         """Generate RETURN clause that includes explicit labels.
@@ -324,6 +367,7 @@ class Transaction(BaseModel):
     tags: List[str] = Field(default_factory=list)
     importance: float = Field(default=0.3, ge=0.0, le=1.0)
     note: Optional[str] = None
+    context: Dict[str, Any] = Field(default_factory=dict)  # Same as Memory — enables cross-type relationships with context
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -337,6 +381,8 @@ class Transaction(BaseModel):
         """Convert to flat dict for storage (both Neo4j and SQLite).
 
         Mirrors MemoryNode.to_neo4j_properties() pattern but for Transaction.
+        Context dict is flattened to context_* keys (same convention as Memory)
+        so NodeFactory._normalize_properties() can regroup them on read.
         """
         props = {
             'id': self.id,
@@ -353,33 +399,31 @@ class Transaction(BaseModel):
         }
         if self.note:
             props['note'] = self.note
+        # Flatten context dict to context_* keys (same convention as Memory)
+        for ctx_key, ctx_value in self.context.items():
+            props[f'context_{ctx_key}'] = ctx_value
         return props
 ```
 
-Register in the default registry (in `type_registry.py:get_default_registry()`):
+Register Transaction via `register_custom_types()` (defined in Phase 1's `type_registry.py`):
 ```python
-def get_default_registry() -> NodeTypeRegistry:
-    from .models import Memory, Transaction
-    registry = NodeTypeRegistry()
-    registry.register(NodeTypeConfig(
-        name="memory",
-        label="Memory",
-        model=Memory,
-        indexes=["id", "type", "title", "importance"],
-        fulltext_fields=["title", "content", "summary"],
-    ))
-    registry.register(NodeTypeConfig(
-        name="transaction",
-        label="Transaction",
-        model=Transaction,
-        indexes=["id", "amount", "merchant", "category", "date"],
-        fulltext_fields=["merchant", "note"],
-        relationship_constraints=[
-            RelationshipConstraint(rel_type="RELATED_TO", target_label="*"),
-            RelationshipConstraint(rel_type="CATEGORIZED_AS", target_label="Memory"),
-        ]
-    ))
-    return registry
+# In type_registry.py — register_custom_types() is called during initialization
+# (e.g., in database __init__ or app startup), NOT from get_default_registry().
+# This avoids the circular dependency: Phase 1 defines the registry,
+# Phase 3 defines Transaction, register_custom_types() wires them together.
+
+# The implementation is already in type_registry.py (Phase 1).
+# Phase 3's job is to create the Transaction model — registration happens
+# when register_custom_types(registry) is called during initialization.
+```
+
+Database initialization wires it together:
+```python
+# In SQLiteMemoryDatabase.__init__ / MemoryDatabase.__init__:
+from .type_registry import get_default_registry, register_custom_types
+
+registry = get_default_registry()   # Phase 1: Memory only
+register_custom_types(registry)     # Phase 3: adds Transaction
 ```
 
 **Acceptance criteria:**
@@ -556,9 +600,76 @@ class NodeFactory:
 
 ### Phase 5: Database API — `store_node` / `get_node` / `search_nodes`
 **Status:** [ ] Not started
-**Files:** `src/memorygraph/database.py` (MODIFY), `src/memorygraph/sqlite_database.py` (MODIFY)
+**Files:** `src/memorygraph/protocols.py` (MODIFY), `src/memorygraph/database.py` (MODIFY), `src/memorygraph/sqlite_database.py` (MODIFY)
 
 This is the core phase that makes everything work end-to-end. Adds three new methods to **both** database classes. Existing `store_memory` / `get_memory` / `search_memories` remain unchanged (backward compatible).
+
+#### 5-pre: MemoryOperations protocol (protocols.py)
+
+The `MemoryOperations` protocol (protocols.py:7-49) defines the common interface that all backends must satisfy. The new node-generic methods must be added here so type checkers enforce them on `SQLiteMemoryDatabase`, `MemoryDatabase`, and any future backends.
+
+```python
+# Added to MemoryOperations in protocols.py (after existing methods)
+
+from pydantic import BaseModel  # add to imports at top of file
+
+class MemoryOperations(Protocol):
+    # ... existing methods (store_memory, get_memory, etc.) unchanged ...
+
+    async def store_node(self, type_name: str, node: BaseModel) -> str:
+        """Store any registered node type and return its ID.
+
+        Args:
+            type_name: Registered type name (e.g., "memory", "transaction").
+            node: Pydantic model instance. Must have an optional `id` field.
+                  If id is None, one is generated. The input object is NOT mutated.
+
+        Returns:
+            The node's ID (generated or existing).
+
+        Raises:
+            KeyError: If type_name is not registered in the NodeTypeRegistry.
+        """
+        ...
+
+    async def get_node(self, node_id: str) -> Optional[BaseModel]:
+        """Retrieve any node by ID, returning the correct Pydantic model.
+
+        Looks up the node across all registered labels and uses
+        NodeFactory to deserialize to the appropriate model type.
+
+        Args:
+            node_id: The node's unique ID.
+
+        Returns:
+            The correctly-typed Pydantic model, or None if not found.
+        """
+        ...
+
+    async def search_nodes(
+        self, type_name: str, filters: dict
+    ) -> List[BaseModel]:
+        """Search nodes of a specific type with property filters.
+
+        Args:
+            type_name: Registered type name to search within.
+            filters: Dict of property_name → value for filtering.
+                     Special keys:
+                       "query" → text search across fulltext_fields
+                       "tags"  → list of tags (ANY match)
+                       "min_importance" → float threshold
+                     All other keys → exact property match.
+
+        Returns:
+            List of correctly-typed Pydantic model instances.
+
+        Raises:
+            KeyError: If type_name is not registered.
+        """
+        ...
+```
+
+**Why this matters:** Without these signatures, `SQLiteMemoryDatabase.store_node` and `MemoryDatabase.store_node` satisfy no shared protocol. Type checkers won't catch missing implementations in future backends, and code accepting `MemoryOperations` can't call the new methods.
 
 #### 5A: SQLiteMemoryDatabase (sqlite_database.py)
 
@@ -582,14 +693,16 @@ async def store_node(self, type_name: str, node: BaseModel) -> str:
 
     Returns:
         Node ID
+
+    NOTE: Does NOT mutate the input `node` object. Works on a copy of
+    the properties to avoid side effects if the caller reuses the object.
     """
     config = self.registry.get(type_name)  # raises KeyError if unknown
     label = config.label
 
-    if not hasattr(node, 'id') or not node.id:
-        node.id = str(uuid.uuid4())
-
-    node.updated_at = datetime.now(timezone.utc)
+    # Generate ID FIRST (before existence check) and avoid mutating input
+    node_id = node.id if hasattr(node, 'id') and node.id else str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
 
     # Get properties — prefer to_storage_properties() if available
     if hasattr(node, 'to_storage_properties'):
@@ -601,30 +714,34 @@ async def store_node(self, type_name: str, node: BaseModel) -> str:
             if isinstance(v, datetime):
                 properties[k] = v.isoformat()
 
+    # Stamp id and updated_at on the PROPERTIES copy, not the input object
+    properties['id'] = node_id
+    properties['updated_at'] = now.isoformat()
+
     properties_json = json.dumps(properties)
 
     # MERGE behavior: update if exists, insert if not
     existing = await asyncio.to_thread(
         self.backend.execute_sync,
         "SELECT id FROM nodes WHERE id = ? AND label = ?",
-        (node.id, label)
+        (node_id, label)
     )
 
     if existing:
         await asyncio.to_thread(
             self.backend.execute_sync,
             "UPDATE nodes SET properties = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND label = ?",
-            (properties_json, node.id, label)
+            (properties_json, node_id, label)
         )
     else:
         await asyncio.to_thread(
             self.backend.execute_sync,
             "INSERT INTO nodes (id, label, properties, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-            (node.id, label, properties_json)
+            (node_id, label, properties_json)
         )
 
     self.backend.commit()
-    return node.id
+    return node_id
 
 async def get_node(self, node_id: str) -> Optional[BaseModel]:
     """Retrieve any node by ID, returning the correct model type.
@@ -668,14 +785,14 @@ async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
     for key, value in filters.items():
         if key == "query" and value:
             pattern = f"%{value}%"
-            # Search common text fields in JSON
-            where_parts.append(
-                "(json_extract(properties, '$.title') LIKE ? OR "
-                "json_extract(properties, '$.content') LIKE ? OR "
-                "json_extract(properties, '$.merchant') LIKE ? OR "
-                "json_extract(properties, '$.note') LIKE ?)"
-            )
-            params.extend([pattern, pattern, pattern, pattern])
+            # Use fulltext_fields from registry (not a hard-coded list)
+            text_fields = config.fulltext_fields or ["title", "content"]
+            field_clauses = [
+                f"json_extract(properties, '$.{f}') LIKE ?"
+                for f in text_fields
+            ]
+            where_parts.append(f"({' OR '.join(field_clauses)})")
+            params.extend([pattern] * len(text_fields))
         elif key == "tags" and value:
             # SQLite JSON array containment
             tag_conditions = []
@@ -687,6 +804,9 @@ async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
             where_parts.append("CAST(json_extract(properties, '$.importance') AS REAL) >= ?")
             params.append(value)
         else:
+            # Validate field name to prevent JSON path injection
+            if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key):
+                raise ValueError(f"Invalid filter field: {key!r}")
             where_parts.append(f"json_extract(properties, '$.{key}') = ?")
             params.append(value)
 
@@ -717,13 +837,15 @@ def __init__(self, connection):
     self.qb = QueryBuilder(self.registry)
 
 async def store_node(self, type_name: str, node: BaseModel) -> str:
-    """Store any registered node type via Cypher MERGE."""
+    """Store any registered node type via Cypher MERGE.
+
+    NOTE: Does NOT mutate the input `node` object.
+    """
     config = self.registry.get(type_name)
 
-    if not hasattr(node, 'id') or not node.id:
-        node.id = str(uuid.uuid4())
-
-    node.updated_at = datetime.now(timezone.utc)
+    # Generate ID FIRST, avoid mutating input
+    node_id = node.id if hasattr(node, 'id') and node.id else str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
 
     if hasattr(node, 'to_storage_properties'):
         properties = node.to_storage_properties()
@@ -733,6 +855,10 @@ async def store_node(self, type_name: str, node: BaseModel) -> str:
             if isinstance(v, datetime):
                 properties[k] = v.isoformat()
 
+    # Stamp id and updated_at on the PROPERTIES copy, not the input object
+    properties['id'] = node_id
+    properties['updated_at'] = now.isoformat()
+
     query = f"""
     {self.qb.merge(type_name)}
     SET m += $properties
@@ -740,24 +866,36 @@ async def store_node(self, type_name: str, node: BaseModel) -> str:
     """
 
     result = await self.connection.execute_write_query(
-        query, {"id": node.id, "properties": properties}
+        query, {"id": node_id, "properties": properties}
     )
 
     if result:
         return result[0]["id"]
-    raise DatabaseConnectionError(f"Failed to store {type_name} node: {node.id}")
+    raise DatabaseConnectionError(f"Failed to store {type_name} node: {node_id}")
 
 async def get_node(self, node_id: str) -> Optional[BaseModel]:
     """Retrieve any node by ID, returning the correct model type.
 
-    Queries across all registered labels and uses NodeFactory for deserialization.
+    Uses a single query with label union (OR) to avoid N round trips.
+    NodeFactory resolves the correct Pydantic model from the labels.
     """
-    # Try each registered type (most queries will hit on first try)
-    for config in self.registry.all_types():
-        query = f"{self.qb.match(config.name)} WHERE m.id = $id {self.qb.return_with_labels()}"
-        result = await self.connection.execute_read_query(query, {"id": node_id})
-        if result:
-            return self.factory.from_neo4j_record(result[0])
+    # Build a single MATCH across all registered labels
+    all_labels = [
+        _validate_identifier(c.label, "label")
+        for c in self.registry.all_types()
+    ]
+    label_union = ":".join(all_labels)  # Neo4j OR: MATCH (m:Memory:Transaction)
+    # NOTE: Neo4j `:A:B` means AND (both labels). For OR, use separate patterns:
+    query = (
+        f"MATCH (m) WHERE m.id = $id "
+        f"AND ANY(lbl IN labels(m) WHERE lbl IN $registered_labels) "
+        f"RETURN m, labels(m) AS labels LIMIT 1"
+    )
+    result = await self.connection.execute_read_query(
+        query, {"id": node_id, "registered_labels": all_labels}
+    )
+    if result:
+        return self.factory.from_neo4j_record(result[0])
 
     return None
 
@@ -769,6 +907,8 @@ async def search_nodes(self, type_name: str, filters: dict) -> List[BaseModel]:
 ```
 
 **Acceptance criteria:**
+- [ ] `MemoryOperations` protocol in protocols.py includes `store_node`, `get_node`, `search_nodes`
+- [ ] `SQLiteMemoryDatabase` and `MemoryDatabase` both satisfy the updated protocol (mypy/pyright pass)
 - [ ] `store_node("transaction", tx)` stores with correct label on both backends
 - [ ] `get_node(id)` returns correctly-typed model on both backends
 - [ ] `search_nodes("transaction", {"category": "dining"})` returns only Transactions
@@ -1091,9 +1231,17 @@ class TestNodeTypeRegistry:
         with pytest.raises(ValueError, match="already registered"):
             registry.register(config)
 
-    def test_all_types_returns_all(self):
-        """all_types() returns every registered config."""
+    def test_all_types_default_registry(self):
+        """get_default_registry() only has Memory (no circular dependency)."""
         registry = get_default_registry()
+        assert len(registry.all_types()) == 1  # memory only
+        assert registry.all_types()[0].name == "memory"
+
+    def test_all_types_with_custom_types(self):
+        """register_custom_types() adds Transaction to registry."""
+        from memorygraph.type_registry import register_custom_types
+        registry = get_default_registry()
+        register_custom_types(registry)
         assert len(registry.all_types()) == 2  # memory + transaction
         names = [t.name for t in registry.all_types()]
         assert "memory" in names
@@ -1106,7 +1254,7 @@ class TestNodeTypeRegistry:
         assert registry.has_type("nonexistent") is False
 ```
 
-**Gate:** All 6 tests pass → Phase 1 is done.
+**Gate:** All 7 tests pass → Phase 1 is done.
 
 ### Phase 2 verification: `tests/test_query_builder.py`
 
@@ -1117,7 +1265,9 @@ from memorygraph.models import Transaction
 
 class TestQueryBuilder:
     def setup_method(self):
+        from memorygraph.type_registry import register_custom_types
         self.registry = get_default_registry()
+        register_custom_types(self.registry)  # Need Transaction for these tests
         self.qb = QueryBuilder(self.registry)
 
     def test_match_memory_unchanged(self):
@@ -1166,9 +1316,10 @@ class TestQueryBuilder:
         with pytest.raises(ValueError, match="Invalid"):
             self.qb.match("memory", alias="m; DROP")
 
-    def test_invalid_key_field_rejected(self):
-        with pytest.raises(ValueError, match="Invalid"):
-            self.qb.merge("memory", key_field="id} SET m.admin=true //")
+    def test_merge_always_uses_id(self):
+        """merge() always uses id as the key — no key_field parameter."""
+        assert self.qb.merge("memory") == "MERGE (m:Memory {id: $id})"
+        assert self.qb.merge("transaction") == "MERGE (m:Transaction {id: $id})"
 
     def test_invalid_relationship_type_rejected(self):
         with pytest.raises(ValueError, match="Invalid"):
@@ -1360,9 +1511,45 @@ class TestDatabaseAPI:
             id: str = None
         with pytest.raises(KeyError):
             await db.store_node("foo", Foo())
+
+    async def test_search_empty_results(self, db):
+        """search_nodes returns empty list when no matches."""
+        results = await db.search_nodes("transaction", {"category": "nonexistent"})
+        assert results == []
+
+    async def test_store_node_does_not_mutate_input(self, db):
+        """store_node must not mutate the input node object."""
+        tx = Transaction(amount=10, merchant="Test", category="test",
+                         date=datetime.now(timezone.utc))
+        original_id = tx.id  # None
+        await db.store_node("transaction", tx)
+        assert tx.id == original_id  # Still None — not mutated
+
+    async def test_store_node_idempotent(self, db):
+        """Storing same ID twice updates instead of creating duplicate."""
+        tx = Transaction(id="fixed-id", amount=10, merchant="Test", category="test",
+                         date=datetime.now(timezone.utc))
+        id1 = await db.store_node("transaction", tx)
+        tx2 = Transaction(id="fixed-id", amount=99, merchant="Updated", category="test",
+                          date=datetime.now(timezone.utc))
+        id2 = await db.store_node("transaction", tx2)
+        assert id1 == id2 == "fixed-id"
+        result = await db.get_node("fixed-id")
+        assert result.amount == 99  # Updated, not duplicated
+
+    async def test_transaction_with_only_required_fields(self, db):
+        """Transaction with only required fields stores and retrieves correctly."""
+        tx = Transaction(amount=5.0, merchant="M", category="c",
+                         date=datetime.now(timezone.utc))
+        tid = await db.store_node("transaction", tx)
+        result = await db.get_node(tid)
+        assert isinstance(result, Transaction)
+        assert result.currency == "USD"  # default
+        assert result.payment_method == "unknown"  # default
+        assert result.note is None
 ```
 
-**Gate:** All 5 tests pass.
+**Gate:** All 9 tests pass.
 
 ### Phase 6 verification: `tests/test_schema_manager.py`
 
@@ -1459,19 +1646,43 @@ class TestMultiLabelIntegration:
         results = await db.search_nodes("transaction", {"category": "dining"})
         assert len(results) >= 1
         assert all(isinstance(r, Transaction) for r in results)
+
+    async def test_backward_compat_old_memory_nodes(self, db):
+        """Pre-existing Memory nodes (stored via store_memory) are still
+        retrievable via get_node and correctly typed as Memory."""
+        memory = Memory(type=MemoryType.SOLUTION, title="Old node", content="Created before multi-label")
+        mid = await db.store_memory(memory)
+
+        # get_node (new API) should find and correctly type old Memory nodes
+        result = await db.get_node(mid)
+        assert isinstance(result, Memory)
+        assert result.title == "Old node"
+
+    async def test_transaction_with_context(self, db):
+        """Transaction with context dict stores and retrieves correctly."""
+        tx = Transaction(
+            amount=100, merchant="AWS", category="infrastructure",
+            date=datetime.now(timezone.utc),
+            context={"project": "KiriInfra", "service": "EC2"}
+        )
+        tid = await db.store_node("transaction", tx)
+        result = await db.get_node(tid)
+        assert isinstance(result, Transaction)
+        assert result.context["project"] == "KiriInfra"
+        assert result.context["service"] == "EC2"
 ```
 
 ### Verification gate per phase
 
 | Phase | Gate command | Must pass |
 |-------|-------------|-----------|
-| 1 | `uv run pytest tests/test_type_registry.py -v` | 6 tests |
+| 1 | `uv run pytest tests/test_type_registry.py -v` | 7 tests |
 | 2 | `uv run pytest tests/test_query_builder.py tests/test_database.py -v` | 14 QB tests + existing DB tests |
 | 3 | `uv run pytest tests/test_transaction_model.py -v` | 5 tests |
 | 4 | `uv run pytest tests/test_node_factory.py -v` | 7 tests |
-| 5 | `uv run pytest tests/test_database_api.py -v` | 5 tests |
+| 5 | `uv run pytest tests/test_database_api.py -v` | 9 tests |
 | 6 | `uv run pytest tests/test_schema_manager.py tests/test_backward_compatibility.py -v` | Schema + backward compat |
-| 7 | `uv run pytest tests/test_multi_label_integration.py -v` | 4 integration tests |
+| 7 | `uv run pytest tests/test_multi_label_integration.py -v` | 6 integration tests |
 | **ALL** | `uv run pytest tests/ -v` | **Every test in the repo passes** |
 
 ### Autonomous workflow rule
@@ -1486,6 +1697,53 @@ After ALL phases: run `uv run pytest tests/ -v` to verify zero regressions acros
 
 ---
 
+## Implementation Notes
+
+### SQLite JSON Performance
+`json_extract()` in WHERE clauses is O(n) per row. For types with many nodes, add **computed column indexes** in Phase 6:
+```sql
+-- Phase 6 already adds these, but implementer should verify they help:
+CREATE INDEX IF NOT EXISTS idx_transaction_category
+  ON nodes(json_extract(properties, '$.category'))
+  WHERE label = 'Transaction';
+```
+For fulltext search on large datasets, consider migrating to **FTS5** (SQLite's fulltext engine) in a future phase.
+
+### Neo4j Temporal Type Handling
+Phase 4's `_normalize_properties()` handles `hasattr(value, 'to_native')`. The specific Neo4j temporal types this covers:
+- `neo4j.time.DateTime` → `datetime.datetime`
+- `neo4j.time.Date` → `datetime.date`
+- `neo4j.time.Time` → `datetime.time`
+- `neo4j.time.Duration` → `datetime.timedelta`
+
+All have `.to_native()` method. Despite `.data()` converting most types, temporal values sometimes survive as Neo4j types in edge cases (e.g., when returned from procedures).
+
+### Concurrent Write Safety
+`store_node` uses MERGE (upsert) on both backends:
+- **Neo4j:** MERGE is atomic at the node level. Concurrent writes to the same ID are safe (last write wins for SET +=).
+- **SQLite:** The SELECT-then-INSERT/UPDATE pattern is NOT atomic. Two concurrent `store_node` calls with the same ID could both see "not existing" and both INSERT, causing a constraint violation. **Mitigation:** Use `INSERT OR REPLACE` (SQLite UPSERT) instead of SELECT+INSERT:
+```sql
+INSERT INTO nodes (id, label, properties, created_at, updated_at)
+VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+ON CONFLICT(id) DO UPDATE SET properties = excluded.properties, updated_at = CURRENT_TIMESTAMP
+```
+This is a recommended improvement during Phase 5 implementation.
+
+### Error Handling
+- `store_node`: Wrap `execute_sync` / `execute_write_query` calls in try/except and raise `DatabaseConnectionError` with context (type_name, node_id).
+- `get_node`: Return `None` on database errors (log warning). Don't crash the MCP server for a single failed lookup.
+- `search_nodes`: Set a reasonable LIMIT (e.g., 1000) on both backends to prevent memory exhaustion on large result sets. Consider adding a `limit` parameter to the method signature.
+
+### Relationship Table Compatibility
+Both backends store relationships using node IDs only (`from_id`, `to_id`), NOT labels. This means cross-type relationships work automatically — no schema changes needed for the relationships table. Verified:
+- **SQLite:** `relationships` table has `from_id TEXT, to_id TEXT` (label-agnostic)
+- **Neo4j:** Relationships connect nodes by reference, not by label
+
+### Registry Immutability
+`NodeTypeRegistry` has no `unregister()` method by design. For testing:
+- Create a fresh registry per test (`NodeTypeRegistry()`) instead of modifying shared state
+- The test fixtures already do this correctly
+
 ## Files Changed Summary
 
 | File | Action | Phase |
@@ -1493,6 +1751,7 @@ After ALL phases: run `uv run pytest tests/ -v` to verify zero regressions acros
 | `src/memorygraph/type_registry.py` | NEW | 1 |
 | `src/memorygraph/query_builder.py` | NEW | 2 |
 | `src/memorygraph/node_factory.py` | NEW | 4 |
+| `src/memorygraph/protocols.py` | MODIFY (add store_node/get_node/search_nodes to MemoryOperations) | 5 |
 | `src/memorygraph/models.py` | MODIFY (add Transaction) | 3 |
 | `src/memorygraph/database.py` | MODIFY (QueryBuilder + store_node/get_node/search_nodes) | 2, 5 |
 | `src/memorygraph/sqlite_database.py` | MODIFY (store_node/get_node/search_nodes) | 5 |
